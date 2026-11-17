@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hyperbot"
+version = "0.1.0"
+description = "Hyperliquid trading bot: backtesting, strategies, risk engine and an LLM decision agent"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "typer>=0.12",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+    "openai>=1.40",
+    "hyperliquid-python-sdk>=0.10",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+hyperbot = "hyperbot.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["hyperbot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

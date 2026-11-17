@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    env_file: .env
+    command: ["auto"]
+    restart: unless-stopped
+    volumes:
+      - ./state:/app/state
+      - ./data:/app/data
+      - ./reports:/app/reports
+
+  # Rule-based alternative (no LLM). Start with: docker compose --profile strategy up -d strategy
+  strategy:
+    profiles: ["strategy"]
+    build: .
+    env_file: .env
+    command: ["run", "BTC", "--strategy", "donchian_breakout", "--interval", "4h"]
+    restart: unless-stopped
+    volumes:
+      - ./state:/app/state
+      - ./data:/app/data
+      - ./reports:/app/reports

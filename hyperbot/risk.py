@@ -1,0 +1,293 @@
+"""Hard risk limits and order execution.
+
+Everything that trades (the LLM agent, the strategy runner, the CLI) goes through
+`Executor.set_target`. The limits here are plain code: the agent cannot talk its
+way past them.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .config import Settings
+from .exchange import AccountState, Broker
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Journal:
+    """Append-only JSONL log of decisions and trades."""
+
+    def __init__(self, state_dir: Path):
+        self.path = Path(state_dir) / "journal.jsonl"
+
+    def write(self, kind: str, **fields) -> dict:
+        rec = {"time": utc_now().isoformat(timespec="seconds"), "kind": kind, **fields}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, default=str) + "\n")
+        return rec
+
+    def tail(self, n: int = 20, kind: str | None = None) -> list[dict]:
+        if not self.path.is_file():
+            return []
+        out = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if kind is None or rec.get("kind") == kind:
+                out.append(rec)
+        return out[-n:]
+
+
+@dataclass
+class RiskDecision:
+    approved: bool
+    target_usd: float
+    notes: list[str] = field(default_factory=list)
+
+
+class RiskManager:
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.path = Path(settings.state_dir) / "risk_state.json"
+        self.state = self._load()
+
+    def _load(self) -> dict:
+        if self.path.is_file():
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        return {"day": "", "day_start_equity": 0.0, "high_water_mark": 0.0, "trades_today": 0, "halted": False, "halt_reason": ""}
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
+
+    def update(self, equity: float) -> None:
+        """Roll the daily counters and trip the kill switch on a drawdown breach."""
+        today = utc_now().strftime("%Y-%m-%d")
+        if self.state["day"] != today:
+            self.state.update(day=today, day_start_equity=equity, trades_today=0)
+        if equity > self.state["high_water_mark"]:
+            self.state["high_water_mark"] = equity
+        hwm = self.state["high_water_mark"]
+        if hwm > 0 and not self.state["halted"]:
+            dd = (1 - equity / hwm) * 100
+            if dd >= self.s.max_drawdown_pct:
+                self.halt(f"drawdown {dd:.1f}% from the high-water mark reached the {self.s.max_drawdown_pct}% limit")
+        self._save()
+
+    def halt(self, reason: str) -> None:
+        self.state.update(halted=True, halt_reason=reason)
+        self._save()
+
+    def resume(self, equity: float | None = None) -> None:
+        self.state.update(halted=False, halt_reason="")
+        if equity is not None:
+            self.state["high_water_mark"] = equity  # restart drawdown tracking from here
+        self._save()
+
+    def daily_pnl_pct(self, equity: float) -> float:
+        start = self.state["day_start_equity"]
+        return (equity / start - 1) * 100 if start > 0 else 0.0
+
+    def record_trade(self) -> None:
+        self.state["trades_today"] += 1
+        self._save()
+
+    def status(self, equity: float) -> dict:
+        hwm = self.state["high_water_mark"]
+        return {
+            "halted": self.state["halted"],
+            "halt_reason": self.state["halt_reason"],
+            "daily_pnl_pct": round(self.daily_pnl_pct(equity), 2),
+            "drawdown_pct": round((1 - equity / hwm) * 100, 2) if hwm > 0 else 0.0,
+            "trades_today": self.state["trades_today"],
+            "limits": self.limits(),
+        }
+
+    def limits(self) -> dict:
+        s = self.s
+        return {
+            "allowed_coins": s.coins,
+            "max_leverage": s.max_leverage,
+            "max_position_pct_of_equity": s.max_position_pct,
+            "max_daily_loss_pct": s.max_daily_loss_pct,
+            "max_drawdown_pct": s.max_drawdown_pct,
+            "max_trades_per_day": s.max_trades_per_day,
+            "min_order_usd": s.min_order_usd,
+            "max_stop_loss_pct": s.max_stop_loss_pct,
+        }
+
+    def check(self, coin: str, target_usd: float, account: AccountState) -> RiskDecision:
+        """Approve, shrink or reject a requested position (signed USD notional)."""
+        s = self.s
+        notes: list[str] = []
+        equity = account.equity
+        cur = account.positions[coin].notional if coin in account.positions else 0.0
+        reducing = abs(target_usd) <= abs(cur) and (target_usd == 0 or (target_usd > 0) == (cur > 0))
+        if reducing:
+            return RiskDecision(True, target_usd, ["risk-reducing: always allowed"])
+        if coin not in s.coins:
+            return RiskDecision(False, cur, [f"{coin} is not in the allowed coins {s.coins}"])
+        if self.state["halted"]:
+            return RiskDecision(False, cur, [f"trading is halted: {self.state['halt_reason']}"])
+        if equity <= 0:
+            return RiskDecision(False, cur, ["account equity is zero"])
+        if self.daily_pnl_pct(equity) <= -s.max_daily_loss_pct:
+            return RiskDecision(False, cur, [f"daily loss limit of {s.max_daily_loss_pct}% reached; only reductions allowed today"])
+        if self.state["trades_today"] >= s.max_trades_per_day:
+            return RiskDecision(False, cur, [f"daily trade limit of {s.max_trades_per_day} reached"])
+
+        sign = 1 if target_usd > 0 else -1
+        size = abs(target_usd)
+        per_coin_cap = equity * s.max_position_pct / 100
+        if size > per_coin_cap:
+            notes.append(f"clamped to the per-coin cap of ${per_coin_cap:,.0f}")
+            size = per_coin_cap
+        other = account.gross_exposure - abs(cur)
+        gross_cap = equity * s.max_leverage - other
+        if size > gross_cap:
+            notes.append(f"clamped to keep total leverage at or below {s.max_leverage}x")
+            size = max(gross_cap, 0.0)
+        if size < s.min_order_usd:
+            return RiskDecision(False, cur, notes + ["nothing left to trade after applying limits"])
+        return RiskDecision(True, sign * size, notes)
+
+
+class Executor:
+    """Moves a coin's position to a target notional, subject to the risk manager."""
+
+    def __init__(self, settings: Settings, broker: Broker, risk: RiskManager, journal: Journal, dry_run: bool = False):
+        self.s = settings
+        self.broker = broker
+        self.risk = risk
+        self.journal = journal
+        self.dry_run = dry_run
+
+    def account(self) -> AccountState:
+        acct = self.broker.account()
+        self.risk.update(acct.equity)
+        return acct
+
+    def set_target(
+        self,
+        coin: str,
+        target_usd: float,
+        stop_loss_pct: float | None = None,
+        take_profit_pct: float | None = None,
+        source: str = "manual",
+        reason: str = "",
+        refresh_protection: bool = True,
+    ) -> dict:
+        """Trade so that `coin` holds `target_usd` of signed notional.
+
+        Stop-loss and take-profit are percentages from the current mark price.
+        """
+        coin = coin.upper()
+        s = self.s
+        acct = self.account()
+        cur = acct.positions[coin].notional if coin in acct.positions else 0.0
+        result: dict = {"coin": coin, "requested_target_usd": round(target_usd, 2), "current_usd": round(cur, 2)}
+
+        if target_usd != 0:
+            if not stop_loss_pct or stop_loss_pct <= 0:
+                stop_loss_pct = s.default_stop_loss_pct
+                result["note_stop"] = f"no stop given, using the default {stop_loss_pct}%"
+            if stop_loss_pct > s.max_stop_loss_pct:
+                stop_loss_pct = s.max_stop_loss_pct
+                result["note_stop"] = f"stop clamped to the maximum {stop_loss_pct}%"
+
+        decision = self.risk.check(coin, target_usd, acct)
+        result["risk_notes"] = decision.notes
+        if not decision.approved:
+            result.update(status="rejected")
+            self.journal.write("rejected", source=source, reason=reason, **result)
+            return result
+        target = decision.target_usd
+        delta = target - cur
+        result["approved_target_usd"] = round(target, 2)
+
+        mid = self.broker.mids().get(coin)
+        if not mid:
+            result.update(status="error", error=f"no price for {coin}")
+            return result
+
+        flip = cur != 0 and target != 0 and (cur > 0) != (target > 0)
+        small = abs(delta) < max(s.min_order_usd, s.rebalance_band * abs(cur))
+        trade_needed = target == 0 and cur != 0 or flip or not small
+        if target == 0 and cur == 0:
+            result.update(status="noop", detail="already flat")
+            return result
+
+        if not trade_needed and not refresh_protection and self.broker.get_protection(coin).get("stop_px"):
+            # Leave the existing stop where it is: re-placing it every tick would
+            # drag it away from a falling price and it would never trigger.
+            result.update(status="hold")
+            return result
+
+        if self.dry_run:
+            result.update(status="dry_run", would_trade_usd=round(delta, 2) if trade_needed else 0.0)
+            self.journal.write("dry_run", source=source, reason=reason, **result)
+            return result
+
+        fills = []
+        if trade_needed:
+            self.broker.cancel_all(coin)
+            if target == 0 or flip:
+                f = self.broker.close(coin)
+                fills.append(f)
+                if not f.ok:
+                    result.update(status="error", error=f"close failed: {f.error}")
+                    self.journal.write("error", source=source, reason=reason, **result)
+                    return result
+                if flip:
+                    self.broker.set_leverage(coin, int(s.max_leverage))
+                    fills.append(self.broker.market(coin, target / mid))
+            elif abs(target) < abs(cur):
+                fills.append(self.broker.market(coin, delta / mid, reduce_only=True))
+            else:
+                self.broker.set_leverage(coin, int(s.max_leverage))
+                fills.append(self.broker.market(coin, delta / mid))
+            failed = [f for f in fills if not f.ok]
+            if failed and len(failed) == len(fills):
+                result.update(status="error", error=failed[0].error)
+                self.journal.write("error", source=source, reason=reason, **result)
+                return result
+            self.risk.record_trade()
+            result["fills"] = [
+                {"size": f.size, "price": f.price, "usd": round(f.size * f.price, 2), "ok": f.ok, "error": f.error}
+                for f in fills
+            ]
+        else:
+            result["detail"] = "position already within the rebalance band; no trade"
+
+        # (Re)place protection on whatever position is now open.
+        if target != 0:
+            pos = self.broker.account().positions.get(coin)
+            if pos:
+                long = pos.size > 0
+                stop_px = pos.mark_px * (1 - stop_loss_pct / 100 if long else 1 + stop_loss_pct / 100)
+                tp_px = None
+                if take_profit_pct and take_profit_pct > 0:
+                    tp_px = pos.mark_px * (1 + take_profit_pct / 100 if long else 1 - take_profit_pct / 100)
+                errors = self.broker.set_protection(coin, stop_px, tp_px)
+                result["stop_px"] = round(stop_px, 6)
+                result["take_profit_px"] = round(tp_px, 6) if tp_px else None
+                if errors:
+                    result["protection_errors"] = errors
+        result["status"] = "executed" if trade_needed else "protection_updated"
+        self.journal.write("trade" if trade_needed else "protection", source=source, reason=reason, **result)
+        return result
+
+    def flatten_all(self, source: str = "manual", reason: str = "") -> list[dict]:
+        out = []
+        for coin in list(self.account().positions):
+            out.append(self.set_target(coin, 0.0, source=source, reason=reason))
+        return out
