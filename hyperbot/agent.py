@@ -16,7 +16,7 @@ from openai import APIConnectionError, APIStatusError, AuthenticationError, Open
 from .backtest import BacktestConfig
 from .config import Settings
 from .data import HLData, interval_ms, load_history
-from .risk import Executor, Journal, utc_now
+from .risk import AICostLedger, Executor, Journal, utc_now
 from .sentiment import snapshot as sentiment_snapshot
 from .signals import quant_snapshot, rank_strategies
 
@@ -186,6 +186,7 @@ class TradingAgent:
         for p in out["positions"]:
             p["protection"] = self.executor.broker.get_protection(p["coin"])
         out["risk"] = self.executor.risk.status(acct.equity)
+        out["pnl"] = self.executor.risk.pnl(acct.equity)
         out["mode"] = self.s.mode + (" (dry run: trades are simulated only)" if self.executor.dry_run else "")
         return out
 
@@ -286,15 +287,21 @@ class TradingAgent:
         )
         messages: list = [{"role": "system", "content": self.system_prompt}, {"role": "user", "content": intro}]
         actions: list[dict] = []
-        usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "calls": 0}
         report = ""
         stop_reason = "max_steps"
 
         for _ in range(s.agent_max_steps):
             resp = self._create(messages)
+            usage["calls"] += 1
             if resp.usage:
-                for key in usage:
-                    usage[key] += getattr(resp.usage, key, 0) or 0
+                usage["prompt_tokens"] += getattr(resp.usage, "prompt_tokens", 0) or 0
+                usage["completion_tokens"] += getattr(resp.usage, "completion_tokens", 0) or 0
+                # DeepSeek reports cache hits at the top level; OpenAI nests them.
+                cached = getattr(resp.usage, "prompt_cache_hit_tokens", None)
+                if cached is None:
+                    cached = getattr(getattr(resp.usage, "prompt_tokens_details", None), "cached_tokens", 0)
+                usage["cached_tokens"] += cached or 0
             choice = resp.choices[0]
             msg = choice.message
             text = (msg.content or "").strip()
@@ -337,7 +344,9 @@ class TradingAgent:
                         self.on_event("action", out)
                 messages.append({"role": "tool", "tool_call_id": call.id, "content": out})
 
+        cost = AICostLedger(s).add(usage["prompt_tokens"], usage["cached_tokens"], usage["completion_tokens"], usage["calls"])
         summary = {
+            "cost_usd": round(cost, 5),
             "report": report or "(the cycle ended without a report)",
             "stop_reason": stop_reason,
             "actions": actions,
@@ -348,6 +357,7 @@ class TradingAgent:
             self.journal_kind,
             report=summary["report"],
             stop_reason=stop_reason,
+            cost_usd=round(cost, 5),
             actions=[{"tool": a["tool"], "input": a["input"], "status": a["result"].get("status")} for a in actions],
         )
         return summary

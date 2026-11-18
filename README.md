@@ -82,6 +82,29 @@ hyperbot auto       # research, pick strategies, trade, repeat
 
 Options: `--tick 5m`, `--review-every 4h`, `--research-every 24h`, `--no-llm`, `--once`, `--dry-run`.
 
+### Simulation
+
+See how the automation would do with a given amount before risking any:
+
+```bash
+hyperbot simulate --amount 5000          # autopilot on pretend money, live prices, runs until stopped
+hyperbot simulate --report               # how it has done so far, with a cost breakdown
+hyperbot simulate --amount 50000 --name big   # a second simulation alongside the first
+hyperbot replay --amount 10000 --days 150     # replay the rule-based autopilot over past months
+```
+
+`simulate` prices each fill in three layers, so your own trading affects your results:
+
+1. **The real order book** is walked for the order's size, so you pay the spread and eat into depth.
+2. **Market reaction**: a square-root impact estimate (daily volatility × √(order size ÷ daily volume)) is added for liquidity that moves away from an order.
+3. **Your own pressure**: each trade leaves an impact that decays (30-minute half-life by default), making follow-up orders in the same direction more expensive.
+
+Funding is charged at the live rate. `HL_SIM_IMPACT` scales the impact estimate (0 off, 2 pessimistic).
+
+What a simulation cannot do is change the real price path: other traders never see these orders, so longer-term reactions such as copying, fading or stop-hunting are not modelled. For a few thousand dollars in BTC, ETH or SOL the modelled impact is a fraction of a basis point; it becomes material with large size or thin coins.
+
+`replay` re-chooses strategies every 14 days using only earlier data, then trades them until the next re-pick. The LLM is left out of replays because a language model may already know what happened in the period.
+
 ### The discretionary agent
 
 A second way to use the LLM: instead of choosing strategies, it sets positions directly each cycle.
@@ -107,6 +130,32 @@ Any OpenAI-compatible API works: change `HL_LLM_BASE_URL`, `HL_AGENT_MODEL` and 
 4. For real money set `HL_MODE=mainnet` and pass `--live` (or `HL_CONFIRM_MAINNET=yes` for Docker).
 
 The private key is read by the bot process only. The LLM never sees it: the model can only call the tools in `hyperbot/agent.py`.
+
+## Use it from Claude Code (MCP) or over HTTP
+
+```bash
+claude mcp add hyperbot -- /absolute/path/to/.venv/bin/hyperbot mcp   # Windows: .venv\Scripts\hyperbot.exe
+```
+
+Run that from the project folder so the server finds `.env` and `state/`. Then prompt Claude Code in plain language, for example "check my hyperbot account and the BTC signals on 4h and 1d, and open a small long if they agree". It gets tools for the account, market, signals, backtests, research, sentiment, trading, the playbook and the kill switch. Trades still pass through the risk limits, and on mainnet they are dry runs unless `HL_CONFIRM_MAINNET=yes`.
+
+```bash
+hyperbot api                      # http://127.0.0.1:8787, docs at /docs
+curl localhost:8787/v1/account
+curl -X POST localhost:8787/v1/set_target -H 'content-type: application/json'      -d '{"coin":"BTC","target_usd":500,"stop_loss_pct":3}'
+```
+
+Set `HL_API_TOKEN` to require `Authorization: Bearer <token>`; the API refuses to listen on a public address without it. `llms.txt` describes the tools and rules for AI agents.
+
+## Net profit after AI cost
+
+Every LLM call's tokens are priced and added to a running bill, and profit is reported after subtracting it:
+
+- `hyperbot status` shows trading PnL, AI cost and net PnL since the bot first saw the account.
+- `hyperbot simulate --report` shows the same for a simulation, plus trading costs.
+- The `account` tool (MCP, API and the agent itself) includes the same `pnl` block.
+
+Trading PnL already includes fees, slippage and funding. Prices default to `deepseek-v4-pro` peak rates ($1.32 input, $0.044 cached input, $3.96 output per million tokens; off-peak is half). Change `HL_LLM_PRICE_*` in `.env` if you use another model. Runs with `--no-llm` cost nothing. Tokens Claude Code spends when it trades through the MCP server are not counted, since the bot cannot see them.
 
 ## Risk limits
 
@@ -139,7 +188,7 @@ State, cached data and reports are kept in `./state`, `./data` and `./reports` o
 ## Known limits
 
 - Backtests fill at the next bar's open with fixed slippage. They ignore order-book depth, partial fills and latency.
-- Paper mode checks stops only when the bot polls, and does not charge funding.
+- Paper mode checks stops only when the bot polls.
 - News sentiment is a keyword count plus the model's reading of headlines. Headlines are untrusted text; the risk limits are the real protection against a manipulated feed.
 - The risk engine sees only this bot's account. If you trade the same account by hand, its counters will still apply.
 
@@ -154,5 +203,7 @@ hyperbot/
   agent.py       LLM agent and its tools        runner.py      loops and the strategy runner
   auto.py        autopilot: research, playbook, portfolio execution
   report.py      HTML reports                   cli.py         commands
+  sim.py         simulation tracker and replay  service.py     operations behind the API and MCP server
+  api.py         HTTP API                       mcp_server.py  MCP server
 tests/           pytest suite (python -m pytest)
 ```

@@ -49,6 +49,8 @@ class Settings:
     slippage_bps: float = 2.0
     live_slippage: float = 0.01  # max slippage tolerated on live market orders
     paper_equity: float = 10_000.0
+    sim_impact: float = 1.0  # multiplier on the simulated market-impact estimate (0 = off)
+    sim_impact_halflife_min: float = 30.0  # how fast our own price pressure fades
 
     # --- hard risk limits (enforced in code, the agent cannot change them)
     max_leverage: float = 3.0  # gross exposure / equity
@@ -67,6 +69,10 @@ class Settings:
     agent_model: str = "deepseek-v4-pro"
     agent_effort: str = "high"  # DeepSeek thinking effort: low | high | max ("" = do not send)
     agent_max_steps: int = 25
+    # LLM prices in USD per 1M tokens (defaults: deepseek-v4-pro peak rates; off-peak is half)
+    llm_price_input: float = 1.32
+    llm_price_input_cached: float = 0.044
+    llm_price_output: float = 3.96
 
     # --- autopilot research
     research_days: float = 180.0
@@ -114,6 +120,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         slippage_bps=_float("HL_SLIPPAGE_BPS", d.slippage_bps),
         live_slippage=_float("HL_LIVE_SLIPPAGE", d.live_slippage),
         paper_equity=_float("HL_PAPER_EQUITY", d.paper_equity),
+        sim_impact=_float("HL_SIM_IMPACT", d.sim_impact),
+        sim_impact_halflife_min=_float("HL_SIM_IMPACT_HALFLIFE_MIN", d.sim_impact_halflife_min),
         max_leverage=_float("HL_MAX_LEVERAGE", d.max_leverage),
         max_position_pct=_float("HL_MAX_POSITION_PCT", d.max_position_pct),
         max_daily_loss_pct=_float("HL_MAX_DAILY_LOSS_PCT", d.max_daily_loss_pct),
@@ -128,6 +136,9 @@ def load_settings(env_file: str | None = None) -> Settings:
         agent_model=os.getenv("HL_AGENT_MODEL", d.agent_model).strip() or d.agent_model,
         agent_effort=os.getenv("HL_AGENT_EFFORT", d.agent_effort).strip(),
         agent_max_steps=_int("HL_AGENT_MAX_STEPS", d.agent_max_steps),
+        llm_price_input=_float("HL_LLM_PRICE_INPUT", d.llm_price_input),
+        llm_price_input_cached=_float("HL_LLM_PRICE_INPUT_CACHED", d.llm_price_input_cached),
+        llm_price_output=_float("HL_LLM_PRICE_OUTPUT", d.llm_price_output),
         research_days=_float("HL_RESEARCH_DAYS", d.research_days),
         research_intervals=[i.strip() for i in os.getenv("HL_RESEARCH_INTERVALS", "1h,4h").split(",") if i.strip()],
     )

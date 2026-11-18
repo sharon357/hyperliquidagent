@@ -46,6 +46,46 @@ def _age_seconds(iso: str) -> float:
 
 
 # ------------------------------------------------------------------ research
+def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable[[str], None] = print) -> list[dict]:
+    """Scorecard rows for every strategy on one coin/timeframe history."""
+    rows = []
+    atr_pct = float(ind.atr(df).iloc[-1] / df["close"].iloc[-1] * 100)
+    for name in tradable_strategies():
+        grid = get_strategy(name).grid
+        try:
+            fitted = grid_search(df, name, cfg).iloc[0]
+            params = {k: type(grid[k][0])(fitted[k]) for k in grid}
+            wf = walk_forward(df, name, cfg, n_splits=WF_SPLITS)
+            signal = float(get_strategy(name, **params).signal(df).iloc[-1])
+        except Exception as e:
+            log(f"research: {coin} {interval} {name} failed: {e}")
+            continue
+        oos = wf["oos_metrics"]
+        rows.append(
+            {
+                "coin": coin,
+                "interval": interval,
+                "strategy": name,
+                "live_params": params,
+                # Out-of-sample: parameters were chosen on earlier data only. This is the honest number.
+                "oos_return_pct": oos["total_return_pct"],
+                "oos_sharpe": oos["sharpe"],
+                "oos_max_dd_pct": oos["max_drawdown_pct"],
+                "oos_trades": oos["trades"],
+                "oos_folds_positive": sum(f["out_of_sample_return_pct"] > 0 for f in wf["folds"]),
+                "oos_folds": WF_SPLITS,
+                # Fitted: best parameters picked with hindsight on the whole window. Flattering.
+                "fitted_return_pct": float(fitted["total_return_pct"]),
+                "fitted_sharpe": float(fitted["sharpe"]),
+                "fitted_max_dd_pct": float(fitted["max_drawdown_pct"]),
+                "buy_hold_return_pct": float(fitted["buy_hold_return_pct"]),
+                "current_signal": round(signal, 2),
+                "atr_pct": round(atr_pct, 2),
+            }
+        )
+    return rows
+
+
 def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> dict:
     """Backtest + walk-forward every strategy on every coin and research timeframe."""
     cfg = BacktestConfig(taker_fee=settings.taker_fee, slippage_bps=settings.slippage_bps)
@@ -57,40 +97,7 @@ def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> d
             except Exception as e:
                 log(f"research: no data for {coin} {interval}: {e}")
                 continue
-            atr_pct = float(ind.atr(df).iloc[-1] / df["close"].iloc[-1] * 100)
-            for name in tradable_strategies():
-                grid = get_strategy(name).grid
-                try:
-                    fitted = grid_search(df, name, cfg).iloc[0]
-                    params = {k: type(grid[k][0])(fitted[k]) for k in grid}
-                    wf = walk_forward(df, name, cfg, n_splits=WF_SPLITS)
-                    signal = float(get_strategy(name, **params).signal(df).iloc[-1])
-                except Exception as e:
-                    log(f"research: {coin} {interval} {name} failed: {e}")
-                    continue
-                oos = wf["oos_metrics"]
-                rows.append(
-                    {
-                        "coin": coin,
-                        "interval": interval,
-                        "strategy": name,
-                        "live_params": params,
-                        # Out-of-sample: parameters were chosen on earlier data only. This is the honest number.
-                        "oos_return_pct": oos["total_return_pct"],
-                        "oos_sharpe": oos["sharpe"],
-                        "oos_max_dd_pct": oos["max_drawdown_pct"],
-                        "oos_trades": oos["trades"],
-                        "oos_folds_positive": sum(f["out_of_sample_return_pct"] > 0 for f in wf["folds"]),
-                        "oos_folds": WF_SPLITS,
-                        # Fitted: best parameters picked with hindsight on the whole window. Flattering.
-                        "fitted_return_pct": float(fitted["total_return_pct"]),
-                        "fitted_sharpe": float(fitted["sharpe"]),
-                        "fitted_max_dd_pct": float(fitted["max_drawdown_pct"]),
-                        "buy_hold_return_pct": float(fitted["buy_hold_return_pct"]),
-                        "current_signal": round(signal, 2),
-                        "atr_pct": round(atr_pct, 2),
-                    }
-                )
+            rows.extend(score_frame(df, coin, interval, cfg, log))
             log(f"research: {coin} {interval} done ({len(df)} bars)")
     rows.sort(key=lambda r: r["oos_sharpe"], reverse=True)
     card = {
@@ -413,7 +420,7 @@ class AutoPilot:
             if self._agent is None:
                 self._agent = PortfolioAgent(self.s, self.executor, runner=self.runner, on_event=self.on_event)
             summary = self._agent.run_cycle()
-            self.log("manager report:\n" + summary["report"])
+            self.log(f"manager report (AI cost ${summary['cost_usd']:.4f}):\n" + summary["report"])
         except AgentError as e:
             self.log(f"LLM manager unavailable: {e}")
             if load_playbook(self.s) is None:

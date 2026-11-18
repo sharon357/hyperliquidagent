@@ -415,3 +415,152 @@ def client_tools(agent):
     from hyperbot.agent import openai_tools
 
     return openai_tools(agent.tool_defs)
+
+
+# ------------------------------------------------------------------ realistic simulation
+def test_walk_book_and_impact():
+    from hyperbot.exchange import sqrt_impact_bps, walk_book
+
+    asks = [(100.0, 1.0), (101.0, 1.0), (102.0, 1.0)]
+    assert walk_book(asks, 0.5) == pytest.approx(100.0)
+    assert walk_book(asks, 2.0) == pytest.approx(100.5)
+    assert walk_book(asks, 6.0) > 102.0  # bigger than the visible book: worse than the last level
+    assert walk_book([], 1.0) is None
+    small, big = sqrt_impact_bps(1e4, 1e9, 3.0), sqrt_impact_bps(1e6, 1e9, 3.0)
+    assert big == pytest.approx(small * 10)  # 100x the size, 10x the impact
+    assert sqrt_impact_bps(1e4, 0, 3.0) == 0.0
+
+
+class BookData(FakeData):
+    """Fake market with an order book, volume and funding."""
+
+    def book_levels(self, coin):
+        m = self.prices[coin]
+        return [(m * 0.999, 10.0), (m * 0.99, 100.0)], [(m * 1.001, 10.0), (m * 1.01, 100.0)]
+
+    def asset_contexts(self):
+        return {c: {"volume_24h_usd": 1e8, "funding_hourly": 0.0001} for c in self.prices}
+
+    def daily_vol_pct(self, coin):
+        return 4.0
+
+
+def test_paper_fills_pay_spread_depth_impact_and_funding(tmp_path):
+    import time as _time
+
+    s = Settings(state_dir=tmp_path, coins=["BTC"], paper_equity=1_000_000, taker_fee=0.0, max_leverage=3)
+    data = BookData()
+    broker = PaperBroker(s, data)
+    f1 = broker.market("BTC", 5.0)  # $500: inside the first level
+    assert f1.price > 100.1  # spread plus a little impact
+    f2 = broker.market("BTC", 50.0)  # $5,000: eats into the second level
+    assert f2.price > f1.price  # deeper book + bigger impact + pressure from the first buy
+    costs = broker.state["costs"]
+    assert costs["spread_and_depth"] > 0 and costs["impact"] > 0
+    # Selling straight after a buy gets no rebate from our own buy pressure.
+    sell = broker.market("BTC", -5.0)
+    assert sell.price < 99.9
+    # Funding: a long pays when the rate is positive.
+    broker.state["funding_time"] = _time.time() - 2 * 3600
+    before = broker.state["cash"]
+    broker.account()
+    assert broker.state["cash"] < before
+    assert costs["funding"] == pytest.approx(50.0 * 100.0 * 0.0001 * 2, rel=0.01)
+
+
+def test_sim_tracker_reports(tmp_path):
+    from hyperbot.sim import SimTracker
+
+    s = Settings(state_dir=tmp_path, coins=["BTC", "ETH"], paper_equity=5000, taker_fee=0.0, slippage_bps=0.0)
+    data = FakeData()
+    broker = PaperBroker(s, data)
+    tracker = SimTracker(s, broker)
+    broker.market("BTC", 25.0)  # $2,500 long
+    tracker.record(broker.account(), data.mids())
+    data.prices.update(BTC=110.0, ETH=9.0)
+    tracker.record(broker.account(), data.mids())
+    rep = tracker.report()
+    assert rep["starting_amount"] == 5000
+    assert rep["trading_return_pct"] == pytest.approx(5.0)  # +10% on half the account
+    assert rep["buy_and_hold_return_pct"] == pytest.approx(0.0)  # +10% and -10%
+    assert rep["trades"] == 1
+
+
+# ------------------------------------------------------------------ service, API
+@pytest.fixture
+def service(stack, monkeypatch):
+    from hyperbot import service as svc_mod
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(svc_mod, "make_broker", lambda settings: broker)
+    svc = svc_mod.Service(s)
+    svc.data = svc.tools.data = data
+    return svc
+
+
+def test_service_trades_through_risk_engine(service):
+    assert service.call("account")["equity_usd"] == 10_000
+    r = service.call("set_target", {"coin": "BTC", "target_usd": "50000", "stop_loss_pct": 2})
+    assert r["status"] == "executed" and r["approved_target_usd"] == pytest.approx(10_000)  # clamped
+    assert service.call("set_target", {"coin": "DOGE", "target_usd": 100, "stop_loss_pct": 2})["status"] == "rejected"
+    assert service.call("kill")["halted"] is True
+    assert service.call("account")["positions"] == []
+    assert service.call("set_target", {"coin": "BTC", "target_usd": 100, "stop_loss_pct": 2})["status"] == "rejected"
+    assert service.call("resume") == {"halted": False}
+    assert "error" in service.call("nope")
+    assert "error" in service.call("signals", {})  # missing argument comes back as an error, not a crash
+    assert "ema_cross" in service.call("strategies")
+
+
+def test_api_auth_and_methods(service):
+    from fastapi.testclient import TestClient
+
+    from hyperbot.api import create_app
+
+    client = TestClient(create_app(service, token="secret"))
+    assert client.get("/health").json()["ok"] is True
+    assert client.get("/v1/account").status_code == 401
+    h = {"Authorization": "Bearer secret"}
+    assert client.get("/v1/account", headers=h).json()["equity_usd"] == 10_000
+    assert "set_target" in client.get("/v1", headers=h).json()["operations"]
+    assert client.get("/v1/set_target", headers=h).status_code == 405  # trading needs POST
+    r = client.post("/v1/set_target", headers=h, json={"coin": "ETH", "target_usd": -1000, "stop_loss_pct": 3})
+    assert r.json()["status"] == "executed"
+    assert client.post("/v1/unknown", headers=h, json={}).status_code == 404
+
+
+# ------------------------------------------------------------------ AI cost and net profit
+def test_ai_cost_is_subtracted_from_profit(stack):
+    from hyperbot.agent import TradingAgent
+    from hyperbot.risk import AICostLedger
+    from hyperbot.sim import SimTracker
+
+    s, data, broker, ex = stack
+    s.llm_price_input, s.llm_price_input_cached, s.llm_price_output = 1_000_000.0, 100_000.0, 2_000_000.0  # $1 / $0.10 / $2 per token
+    client = ScriptedClient(
+        [
+            {"calls": [("set_target_position", {"coin": "BTC", "target_usd": 5000, "stop_loss_pct": 5, "take_profit_pct": 0, "thesis": "t"})]},
+            {"text": "done"},
+        ]
+    )
+    summary = TradingAgent(s, ex, data, client=client).run_cycle()
+    # Two model calls, each 10 prompt + 5 completion tokens, nothing cached: 2 * (10*$1 + 5*$2) = $40
+    assert summary["cost_usd"] == pytest.approx(40.0)
+    assert AICostLedger(s).load()["cycles"] == 1
+    assert AICostLedger(s).price(10, 4, 0) == pytest.approx(6 * 1.0 + 4 * 0.1)  # cached tokens are cheaper
+
+    data.prices["BTC"] = 102.0  # +2% on $5,000 = +$100 trading profit
+    acct = ex.account()
+    pnl = ex.risk.pnl(acct.equity)
+    assert pnl["trading_pnl_usd"] == pytest.approx(100.0)
+    assert pnl["ai_cost_usd"] == pytest.approx(40.0)
+    assert pnl["net_pnl_usd"] == pytest.approx(60.0)
+
+    tracker = SimTracker(s, broker)
+    tracker.record(acct, data.mids())
+    rep = tracker.report()
+    assert rep["trading_pnl_usd"] == pytest.approx(100.0) and rep["net_pnl_usd"] == pytest.approx(60.0)
+    assert rep["net_return_pct"] == pytest.approx(0.6)
+
+    data.prices["BTC"] = 99.0  # a trading loss gets bigger once the AI bill is added
+    assert ex.risk.pnl(ex.account().equity)["net_pnl_usd"] == pytest.approx(-50.0 - 40.0)

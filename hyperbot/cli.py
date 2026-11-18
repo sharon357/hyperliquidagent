@@ -299,6 +299,9 @@ def status():
     console.print(_metrics_table(d, "Account"))
     if positions:
         console.print(_table(pd.DataFrame(positions), "Positions"))
+    pnl = executor.risk.pnl(acct.equity)
+    pnl.pop("note")
+    console.print(_metrics_table(pnl, "Profit and loss (net = trading PnL minus AI cost)"))
     risk = executor.risk.status(acct.equity)
     limits = risk.pop("limits")
     console.print(_metrics_table(risk, "Risk state"))
@@ -368,7 +371,10 @@ def paper_reset():
 
     s = load_settings()
     PaperBroker(s).reset()
-    RiskManager(s).resume(s.paper_equity)
+    rm = RiskManager(s)
+    rm.state["baseline_equity"] = 0.0  # profit and loss start again from the new balance
+    rm.resume(s.paper_equity)
+    (s.state_dir / "llm_usage.json").unlink(missing_ok=True)
     console.print(f"Paper account reset to ${s.paper_equity:,.0f}.")
 
 
@@ -449,7 +455,7 @@ def agent(
         summary = bot.run_cycle()
         console.print(Panel(summary["report"], title="Agent report", title_align="left"))
         u = summary["usage"]
-        console.log(f"{len(summary['actions'])} trade action(s); tokens in {u['prompt_tokens']:,} / out {u['completion_tokens']:,}")
+        console.log(f"{len(summary['actions'])} trade action(s); tokens in {u['prompt_tokens']:,} / out {u['completion_tokens']:,}; AI cost ${summary['cost_usd']:.4f}")
 
     if once:
         try:
@@ -545,8 +551,9 @@ def auto(
         results = pilot.tick()
         acct = executor.account()
         moved = [r for r in results if r["status"] not in ("hold", "noop")]
+        pnl = executor.risk.pnl(acct.equity)
         console.log(
-            f"equity ${acct.equity:,.2f}, {len(acct.positions)} position(s), "
+            f"equity ${acct.equity:,.2f}, net PnL after AI cost ${pnl['net_pnl_usd']:+,.2f} (AI ${pnl['ai_cost_usd']:.2f}), {len(acct.positions)} position(s), "
             + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
         )
 
@@ -555,6 +562,138 @@ def auto(
         _show_playbook(load_playbook(s))
     else:
         run_forever(step, parse_duration(tick), console.log)
+
+
+@app.command()
+def simulate(
+    amount: float = typer.Option(10_000.0, "--amount", "-a", help="Starting balance in USD"),
+    name: str = typer.Option("default", "--name", help="Run several simulations side by side under different names"),
+    tick: str = typer.Option("5m", "--tick"),
+    review_every: str = typer.Option("4h", "--review-every"),
+    research_every: str = typer.Option("24h", "--research-every"),
+    no_llm: bool = typer.Option(False, "--no-llm", help="Pick strategies by the fixed rule instead of the LLM"),
+    once: bool = typer.Option(False, "--once", help="Run a single tick and exit"),
+    report: bool = typer.Option(False, "--report", help="Only show how the simulation has done so far"),
+    reset: bool = typer.Option(False, "--reset", help="Delete this simulation and start again"),
+):
+    """Run the autopilot on pretend money against the live market, with realistic fills, and track the result."""
+    import shutil
+
+    from .auto import AutoPilot
+    from .exchange import PaperBroker
+    from .risk import AICostLedger, Executor, Journal, RiskManager
+    from .runner import parse_duration, run_forever
+    from .sim import SimTracker
+
+    base = load_settings()
+    sim_dir = base.state_dir / "sim" / name
+    if reset and sim_dir.is_dir():
+        shutil.rmtree(sim_dir)
+        console.print(f"Simulation '{name}' deleted.")
+    s = replace(base, mode="paper", state_dir=sim_dir, paper_equity=amount)
+    s.ensure_dirs()
+    broker = PaperBroker(s)
+    tracker = SimTracker(s, broker)
+
+    def show_report():
+        rep = tracker.report()
+        if rep:
+            console.print(_metrics_table(rep, f"Simulation '{name}'"))
+        else:
+            console.print(f"Simulation '{name}' has not recorded anything yet.")
+
+    if report:
+        show_report()
+        return
+    started = broker.state.get("start_equity", amount)
+    if started != amount:
+        console.print(f"[yellow]Simulation '{name}' already exists with ${started:,.0f}; continuing it. Use --reset to start over with ${amount:,.0f}.[/yellow]")
+    console.print(f"[bold green]SIMULATION '{name}'[/bold green]: ${started:,.0f} of pretend money on live prices. Coins: {', '.join(s.coins)}")
+    executor = Executor(s, broker, RiskManager(s), Journal(s.state_dir))
+    use_llm = not no_llm
+    if use_llm and not s.llm_api_key:
+        console.print("[yellow]DEEPSEEK_API_KEY is not set: strategies will be picked by the built-in rule, not the AI.[/yellow]")
+        use_llm = False
+
+    def on_event(kind: str, text: str) -> None:
+        if kind in ("tool", "action"):
+            console.log(f"[cyan]{kind}[/cyan] {text[:300]}")
+
+    pilot = AutoPilot(s, executor, use_llm, parse_duration(review_every), parse_duration(research_every), console.log, on_event)
+    ledger = AICostLedger(s)
+
+    def step():
+        results = pilot.tick()
+        acct = executor.account()
+        row = tracker.record(acct, broker.mids())
+        moved = [r for r in results if r["status"] not in ("hold", "noop")]
+        console.log(
+            f"equity ${row['equity']:,.2f} ({(row['equity'] / started - 1) * 100:+.2f}%), net of AI cost ${row['equity'] - started - ledger.total():+,.2f}, "
+            f"buy-and-hold ${row['benchmark']:,.2f}, {len(acct.positions)} position(s), "
+            + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
+        )
+
+    if once:
+        step()
+        show_report()
+    else:
+        run_forever(step, parse_duration(tick), console.log)
+        show_report()
+
+
+@app.command()
+def replay(
+    amount: float = typer.Option(10_000.0, "--amount", "-a", help="Starting balance in USD"),
+    days: float = typer.Option(150.0, "--days", "-d", help="How far back to replay"),
+    interval: str = typer.Option("4h", "--interval", "-i"),
+    repick_days: int = typer.Option(14, "--repick-days", help="How often strategies are re-chosen"),
+    lookback_days: float = typer.Option(150.0, "--lookback-days", help="History used for each research run"),
+):
+    """Replay the rule-based autopilot over past months: research, pick, trade, re-pick, with no hindsight."""
+    from .sim import replay as run_replay
+
+    s = load_settings()
+    console.print(
+        f"Replaying {days:g} days on {interval} candles with ${amount:,.0f}; strategies re-picked every {repick_days} days "
+        "from earlier data only. This takes a few minutes."
+    )
+    out = run_replay(s, amount, days, interval, repick_days, lookback_days, console.log)
+    console.print(_table(pd.DataFrame(out["periods"]), "Periods"))
+    console.print(_metrics_table(out["metrics"], "Replay result (buy hold = equal-weight basket of the coins)"))
+    path = s.reports_dir / f"replay_{interval}_{int(days)}d.csv"
+    pd.DataFrame({"equity": out["equity"], "buy_and_hold": out["benchmark"]}).to_csv(path)
+    console.print(f"Equity curve: {path}")
+    console.print("[yellow]The LLM is not part of a replay: a language model may already know what happened in this period.[/yellow]")
+
+
+@app.command()
+def mcp():
+    """Start the MCP server (stdio) so an AI client such as Claude Code can use the bot."""
+    from .mcp_server import main
+
+    main()
+
+
+@app.command()
+def api(
+    host: str = typer.Option("127.0.0.1", "--host", help="Use 0.0.0.0 to accept remote connections (needs HL_API_TOKEN)"),
+    port: int = typer.Option(8787, "--port"),
+):
+    """Start the HTTP API."""
+    import os
+
+    import uvicorn
+
+    from .api import create_app
+
+    token = os.getenv("HL_API_TOKEN", "").strip()
+    load_settings()  # loads .env
+    token = token or os.getenv("HL_API_TOKEN", "").strip()
+    if host not in ("127.0.0.1", "localhost", "::1") and not token:
+        console.print("[red]Refusing to listen on a public address without HL_API_TOKEN set.[/red]")
+        raise typer.Exit(2)
+    console.print(f"API on http://{host}:{port}  (docs at /docs, token {'required' if token else 'not set: localhost only'})")
+    uvicorn.run(create_app(token=token), host=host, port=port, log_level="warning")
 
 
 @app.command()

@@ -154,6 +154,20 @@ class HLData:
             }
         return out
 
+    def book_levels(self, coin: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        """Raw order book: (bids, asks), each a list of (price, size), best price first."""
+        book = self._post({"type": "l2Book", "coin": coin})
+        bids = [(float(x["px"]), float(x["sz"])) for x in book["levels"][0]]
+        asks = [(float(x["px"]), float(x["sz"])) for x in book["levels"][1]]
+        return bids, asks
+
+    def daily_vol_pct(self, coin: str, days: int = 30) -> float:
+        """Standard deviation of daily returns, in percent."""
+        end = now_ms()
+        c = self.candles(coin, "1d", end - (days + 2) * 86_400_000, end)["close"]
+        r = c.pct_change().dropna()
+        return float(r.std() * 100) if len(r) > 5 else 3.0
+
     def orderbook(self, coin: str, depth: int = 10) -> dict:
         book = self._post({"type": "l2Book", "coin": coin})
         bids, asks = book["levels"][0][:depth], book["levels"][1][:depth]

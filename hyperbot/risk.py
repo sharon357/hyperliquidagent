@@ -20,6 +20,41 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+class AICostLedger:
+    """Running total of what the LLM has cost, kept next to the account it trades."""
+
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.path = Path(settings.state_dir) / "llm_usage.json"
+
+    def load(self) -> dict:
+        if self.path.is_file():
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        return {"calls": 0, "cycles": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
+
+    def price(self, prompt: int, cached: int, completion: int) -> float:
+        s = self.s
+        fresh = max(prompt - cached, 0)
+        return (fresh * s.llm_price_input + cached * s.llm_price_input_cached + completion * s.llm_price_output) / 1e6
+
+    def add(self, prompt: int, cached: int, completion: int, calls: int) -> float:
+        """Record one decision cycle's usage. Returns that cycle's cost in USD."""
+        cost = self.price(prompt, cached, completion)
+        d = self.load()
+        d["calls"] += calls
+        d["cycles"] += 1
+        d["prompt_tokens"] += prompt
+        d["cached_tokens"] += cached
+        d["completion_tokens"] += completion
+        d["cost_usd"] = round(d["cost_usd"] + cost, 6)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        return cost
+
+    def total(self) -> float:
+        return float(self.load()["cost_usd"])
+
+
 class Journal:
     """Append-only JSONL log of decisions and trades."""
 
@@ -63,7 +98,7 @@ class RiskManager:
     def _load(self) -> dict:
         if self.path.is_file():
             return json.loads(self.path.read_text(encoding="utf-8"))
-        return {"day": "", "day_start_equity": 0.0, "high_water_mark": 0.0, "trades_today": 0, "halted": False, "halt_reason": ""}
+        return {"day": "", "day_start_equity": 0.0, "high_water_mark": 0.0, "trades_today": 0, "halted": False, "halt_reason": "", "baseline_equity": 0.0}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +107,9 @@ class RiskManager:
     def update(self, equity: float) -> None:
         """Roll the daily counters and trip the kill switch on a drawdown breach."""
         today = utc_now().strftime("%Y-%m-%d")
+        if not self.state.get("baseline_equity") and equity > 0:
+            # Equity when the bot first saw the account: the starting point for profit and loss.
+            self.state.update(baseline_equity=equity, baseline_time=utc_now().isoformat(timespec="seconds"))
         if self.state["day"] != today:
             self.state.update(day=today, day_start_equity=equity, trades_today=0)
         if equity > self.state["high_water_mark"]:
@@ -92,6 +130,22 @@ class RiskManager:
         if equity is not None:
             self.state["high_water_mark"] = equity  # restart drawdown tracking from here
         self._save()
+
+    def pnl(self, equity: float) -> dict:
+        """Profit and loss since the bot first saw the account, before and after the LLM bill."""
+        base = self.state.get("baseline_equity") or equity
+        gross = equity - base
+        ai = AICostLedger(self.s).total()
+        net = gross - ai
+        return {
+            "since": self.state.get("baseline_time", ""),
+            "starting_equity_usd": round(base, 2),
+            "trading_pnl_usd": round(gross, 2),
+            "ai_cost_usd": round(ai, 4),
+            "net_pnl_usd": round(net, 2),
+            "net_return_pct": round(net / base * 100, 3) if base else 0.0,
+            "note": "trading PnL already includes fees, slippage and funding; deposits or withdrawals after the start distort it",
+        }
 
     def daily_pnl_pct(self, equity: float) -> float:
         start = self.state["day_start_equity"]
