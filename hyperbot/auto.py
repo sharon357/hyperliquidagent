@@ -909,6 +909,7 @@ class AutoPilot:
             _age_seconds(card["generated"]) > self.research_seconds
             or card.get("coins", self.s.coins) != list(self.s.coins)
             or (self.s.universe_mode == "auto" and not universe._path(self.s).is_file())  # first run in auto mode
+            or any("pbo" not in r for r in card.get("rows", [])[:1])  # scorecard written by an older version
         )
         if card is None or stale:
             self.log("running research (backtests and walk-forward on every strategy); this takes a few minutes")
