@@ -390,11 +390,14 @@ class HyperliquidBroker(Broker):
         return {k: float(v) for k, v in self.info.all_mids().items()}
 
     def net_deposits(self) -> float | None:
-        """USDC paid into the account minus USDC taken out, from the exchange's ledger."""
+        """USDC paid into the account minus USDC taken out, from the exchange's ledger (cached for a minute)."""
+        cached = getattr(self, "_deposit_cache", None)
+        if cached and time.time() - cached[0] < 60:
+            return cached[1]
         try:
             ledger = self.info.post("/info", {"type": "userNonFundingLedgerUpdates", "user": self.address, "startTime": 0})
         except Exception:
-            return None
+            return cached[1] if cached else None
         me = self.address.lower()
         total = 0.0
         for entry in ledger:
@@ -409,6 +412,7 @@ class HyperliquidBroker(Broker):
                     continue
                 amount = float(d.get("amount") or d.get("usdc") or 0)
                 total += amount if str(d.get("destination", "")).lower() == me else -amount
+        self._deposit_cache = (time.time(), total)
         return total
 
     def _spot_usdc(self) -> tuple[float, float]:

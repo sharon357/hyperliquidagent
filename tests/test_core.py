@@ -729,3 +729,20 @@ def test_scorecard_rows_carry_coin_momentum(monkeypatch):
     rows = auto.score_frame(make_df(n=1200), "X", "1h", BacktestConfig(), log=lambda m: None)
     assert rows and {"coin_return_7d_pct", "coin_return_30d_pct", "coin_daily_vol_pct"} <= set(rows[0])
     assert rows[0]["coin_daily_vol_pct"] > 0
+
+
+def test_deposits_do_not_distort_daily_loss_or_drawdown(tmp_path):
+    s = Settings(state_dir=tmp_path, coins=["BTC"], max_daily_loss_pct=10, max_drawdown_pct=30)
+    rm = RiskManager(s)
+    rm.update(5.8, net_deposits=5.8)
+    assert rm.daily_pnl_pct(5.8) == pytest.approx(0.0)
+    rm.update(30.8, net_deposits=30.8)  # a $25 deposit is not a 431% gain
+    assert rm.daily_pnl_pct(30.8) == pytest.approx(0.0)
+    assert rm.state["high_water_mark"] == pytest.approx(30.8)
+    rm.update(27.0, net_deposits=30.8)  # a real loss still registers against the topped-up balance
+    assert rm.daily_pnl_pct(27.0) == pytest.approx(-12.34, abs=0.01)
+    acct = AccountState(27.0, 27.0, 0.0, {})
+    assert not rm.check("BTC", 20.0, acct).approved  # past the 10% daily loss limit
+    rm.update(17.0, net_deposits=20.8)  # withdrawing $10 is not a drawdown
+    assert not rm.state["halted"]
+    assert rm.pnl(17.0, 20.8)["trading_pnl_usd"] == pytest.approx(-3.8)

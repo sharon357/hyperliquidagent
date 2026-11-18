@@ -734,15 +734,15 @@ def serve(
     if not use_llm:
         console.print("Strategies are picked by the built-in rule (no LLM key, or --no-llm).")
     lock = threading.Lock()
-    pilot = AutoPilot(s, executor, use_llm, parse_duration(review_every), parse_duration(research_every), console.log)
+    pilot = AutoPilot(s, executor, use_llm, parse_duration(review_every), parse_duration(research_every), console.log, lock=lock)
     service = Service(s, executor=executor, runner=pilot.runner, lock=lock)
     wait = parse_duration(tick)
 
     def loop():
         while True:
             try:
+                results = pilot.tick()  # takes the lock itself, only around account reads and trades
                 with lock:
-                    results = pilot.tick()
                     acct = executor.account()
                     pnl = executor.pnl_report(acct.equity)
                 moved = [r for r in results if r["status"] not in ("hold", "noop")]

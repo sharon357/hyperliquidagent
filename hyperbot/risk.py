@@ -104,8 +104,23 @@ class RiskManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
 
-    def update(self, equity: float) -> None:
-        """Roll the daily counters and trip the kill switch on a drawdown breach."""
+    def update(self, equity: float, net_deposits: float | None = None) -> None:
+        """Roll the daily counters and trip the kill switch on a drawdown breach.
+
+        `net_deposits` (live accounts) is everything paid in minus everything taken out.
+        When it changes, the day's starting balance and the high-water mark move by the
+        same amount, so a deposit is not read as profit and a withdrawal is not read as a loss.
+        """
+        if net_deposits is not None:
+            if "net_deposits" not in self.state:
+                # First time this account is tracked with deposits: restart the reference points here.
+                self.state.update(net_deposits=net_deposits, day_start_equity=equity)
+                self.state["high_water_mark"] = max(self.state.get("high_water_mark", 0.0), equity)
+            elif abs(net_deposits - self.state["net_deposits"]) > 1e-6:
+                moved = net_deposits - self.state["net_deposits"]
+                self.state["net_deposits"] = net_deposits
+                self.state["day_start_equity"] = max(self.state["day_start_equity"] + moved, 0.0)
+                self.state["high_water_mark"] = max(self.state["high_water_mark"] + moved, 0.0)
         today = utc_now().strftime("%Y-%m-%d")
         if not self.state.get("baseline_equity") and equity > 0:
             # Equity when the bot first saw the account: the starting point for profit and loss.
@@ -235,14 +250,16 @@ class Executor:
         self.journal = journal
         self.dry_run = dry_run
 
+    def _deposits(self) -> float | None:
+        return getattr(self.broker, "net_deposits", lambda: None)()
+
     def account(self) -> AccountState:
         acct = self.broker.account()
-        self.risk.update(acct.equity)
+        self.risk.update(acct.equity, self._deposits())
         return acct
 
     def pnl_report(self, equity: float) -> dict:
-        deposits = getattr(self.broker, "net_deposits", lambda: None)()
-        return self.risk.pnl(equity, deposits)
+        return self.risk.pnl(equity, self._deposits())
 
     def set_target(
         self,

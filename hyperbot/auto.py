@@ -12,7 +12,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,8 +41,11 @@ def _read(path: Path):
 
 
 def _write(path: Path, obj) -> None:
+    """Write JSON atomically, so a reader never sees a half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, default=str), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 def _age_seconds(iso: str) -> float:
@@ -481,9 +486,16 @@ class PortfolioAgent(TradingAgent):
     task = "Review the research, the current playbook and the market, update the playbook if it should change, then write your report."
     journal_kind = "manager_cycle"
 
-    def __init__(self, *args, runner: PortfolioRunner, **kw):
+    def __init__(self, *args, runner: PortfolioRunner, lock=None, **kw):
         super().__init__(*args, **kw)
         self.runner = runner
+        self.lock = lock or contextlib.nullcontext()
+
+    def dispatch(self, name: str, args: dict) -> tuple[str, bool]:
+        # Each tool call takes the account lock briefly, instead of the whole cycle holding it,
+        # so the API stays responsive while the model is thinking.
+        with self.lock:
+            return super().dispatch(name, args)
 
     def _check_coin(self, coin: str) -> str:
         return coin.upper().strip()  # reading signals for any perp is fine; trading is gated by the risk engine
@@ -600,9 +612,11 @@ class AutoPilot:
         research_seconds: int = 24 * 3600,
         log: Callable[[str], None] = print,
         on_event: Callable[[str, str], None] | None = None,
+        lock=None,
     ):
         self.s = settings
         self.executor = executor
+        self.lock = lock or contextlib.nullcontext()
         self.use_llm = use_llm
         self.review_seconds = review_seconds
         self.research_seconds = research_seconds
@@ -632,7 +646,7 @@ class AutoPilot:
             return
         try:
             if self._agent is None:
-                self._agent = PortfolioAgent(self.s, self.executor, runner=self.runner, on_event=self.on_event)
+                self._agent = PortfolioAgent(self.s, self.executor, runner=self.runner, on_event=self.on_event, lock=self.lock)
             summary = self._agent.run_cycle()
             self.log(f"manager report (AI cost ${summary['cost_usd']:.4f}, ended: {summary['stop_reason']}):\n" + summary["report"])
         except AgentError as e:
@@ -658,7 +672,8 @@ class AutoPilot:
                     picks = universe.shortlist(
                         universe.scan(self.executor_data(), self.s.min_volume_usd), self.s.core_coins, self.s.universe_extra
                     )
-                    held = [c for c in self.executor.account().positions if c not in picks]
+                    with self.lock:
+                        held = [c for c in self.executor.account().positions if c not in picks]
                     self.s.coins[:] = (picks + held)[: universe.MAX_UNIVERSE + len(held)]
                     universe.save(self.s)
                     self.log(f"universe for this research run: {', '.join(self.s.coins)}")
@@ -666,7 +681,8 @@ class AutoPilot:
                     self.log(f"universe scan failed, keeping {self.s.coins}: {e}")
             card = build_scorecard(self.s, self.log)
             fresh = True
-        equity = self.executor.account().equity
+        with self.lock:
+            equity = self.executor.account().equity
         # A deposit or withdrawal changes what sizes are possible, so decide again.
         resized = self.last_review_equity > 0 and abs(equity / self.last_review_equity - 1) > 0.25
         if resized:
@@ -674,4 +690,5 @@ class AutoPilot:
         if fresh or resized or load_playbook(self.s) is None or time.time() - self.last_review > self.review_seconds:
             self.last_review_equity = equity
             self.manage(card, fresh)
-        return self.runner.step(load_playbook(self.s))
+        with self.lock:  # only the part that trades holds the account lock
+            return self.runner.step(load_playbook(self.s))
