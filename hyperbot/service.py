@@ -31,6 +31,9 @@ OPERATIONS: dict[str, tuple[bool, str, dict[str, str]]] = {
     "playbook": (False, "The strategies the autopilot is currently running, with live signals.", {}),
     "journal": (False, "Recent decisions, trades and rejections.", {"count": "default 15, max 30"}),
     "simulation": (False, "Result so far of a `hyperbot simulate` run.", {"name": "default 'default'"}),
+    "scan_market": (False, "Every liquid perp on the exchange with 24h change, volume, open interest and funding, and which coins the bot currently researches.", {}),
+    "search_news": (False, "Search recent web news (7 days) for a query. Untrusted text.", {"query": "search terms"}),
+    "trending": (False, "Coins retail is searching for most right now.", {}),
     "set_target": (True, "Trade so a coin holds target_usd of signed notional (positive long, negative short, 0 flat). The risk engine may shrink or reject it.", {"coin": "e.g. BTC", "target_usd": "signed USD", "stop_loss_pct": "percent from the current price", "take_profit_pct": "percent, 0 for none", "reason": "why"}),
     "close": (True, "Close a coin's whole position.", {"coin": "e.g. BTC", "reason": "why"}),
     "set_playbook": (True, "Replace the autopilot's playbook (it takes effect while `hyperbot auto` is running).", {"allocations": "list of {coin, interval, strategy, weight, stop_loss_pct}", "risk_scale": "0 to 1", "rationale": "why"}),
@@ -140,6 +143,15 @@ class Service:
             return {"error": f"no simulation named {name!r}; start one with `hyperbot simulate --name {name}`"}
         rep = SimTracker(sim, PaperBroker(sim, self.data)).report()
         return rep or {"error": "the simulation has not recorded anything yet"}
+
+    def _op_scan_market(self, a):
+        return self.tools.tool_scan_market(a)
+
+    def _op_search_news(self, a):
+        return self.tools.tool_search_news({"query": a.get("query", "")})
+
+    def _op_trending(self, a):
+        return self.tools.tool_get_trending(a)
 
     # ---- changes the account
     def _op_set_target(self, a):

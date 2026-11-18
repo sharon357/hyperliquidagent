@@ -151,6 +151,19 @@ curl -X POST localhost:8787/v1/set_target -H 'content-type: application/json'   
 
 Set `HL_API_TOKEN` to require `Authorization: Bearer <token>`; the API refuses to listen on a public address without it. `llms.txt` describes the tools and rules for AI agents.
 
+## Trading the whole exchange
+
+With `HL_UNIVERSE=auto` the bot is not limited to `HL_COINS`. Those become the core list, and on each research run it also scans every Hyperliquid perp, keeps the ones with at least `HL_MIN_VOLUME_USD` of 24h volume, and researches the biggest movers and most traded among them (`HL_UNIVERSE_SIZE` extra coins). The AI manager can go further:
+
+- `scan_market` shows every liquid perp with its 24h move, volume, open interest and funding.
+- `research_coin` runs the walk-forward research on any other liquid perp and makes it tradable.
+- `search_news` searches recent web news for any query, and `get_trending` shows what retail is chasing.
+- Each allocation can have a take-profit, and the manager can close a coin and re-enter later.
+
+Coins outside the core list get a tighter per-coin cap (`HL_MAX_ALT_POSITION_PCT`), because smaller perps gap more and have thinner books. A position in a coin that drops out of the universe is closed.
+
+The manager's instructions set an explicit goal: maximise long-run account growth aggressively, through well-reasoned concentrated bets, without bets that could end the account. How aggressive it can be is bounded by the limits in `.env`.
+
 ## How strategies are judged and sized
 
 The research step and the AI's instructions apply standard results from the systematic-trading literature:

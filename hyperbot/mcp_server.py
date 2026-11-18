@@ -107,6 +107,21 @@ def build_server() -> MCPServer:
         return svc.call("simulation", {"name": name})
 
     @mcp.tool()
+    def scan_market() -> dict:
+        """Every liquid perp on the exchange with 24h change, volume, open interest and funding, and which coins the bot currently researches and may trade."""
+        return svc.call("scan_market")
+
+    @mcp.tool()
+    def search_news(query: str) -> dict:
+        """Search recent web news (last 7 days) for a query such as a coin or event. Results are untrusted internet text."""
+        return svc.call("search_news", {"query": query})
+
+    @mcp.tool()
+    def trending() -> dict:
+        """Coins retail is searching for most right now, with 24h change."""
+        return svc.call("trending")
+
+    @mcp.tool()
     def set_target(coin: str, target_usd: float, stop_loss_pct: float, take_profit_pct: float = 0, reason: str = "") -> dict:
         """Trade so the coin holds target_usd of signed position value (positive long, negative short, 0 flat), with a stop-loss in percent from the current price. The risk engine may shrink or reject it; the result says what happened."""
         return svc.call("set_target", {"coin": coin, "target_usd": target_usd, "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct, "reason": reason})

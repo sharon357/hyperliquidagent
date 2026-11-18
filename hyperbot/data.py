@@ -151,6 +151,7 @@ class HLData:
                 "volume_24h_usd": num("dayNtlVlm"),
                 "premium_pct": num("premium") * 100,
                 "max_leverage": asset.get("maxLeverage"),
+                "delisted": bool(asset.get("isDelisted", False)),
             }
         return out
 

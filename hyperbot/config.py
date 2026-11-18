@@ -37,6 +37,11 @@ class Settings:
     private_key: str = field(default="", repr=False)
     account_address: str = ""
     coins: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    core_coins: list[str] = field(default_factory=list)  # the configured list; `coins` may grow in auto mode
+    universe_mode: str = "fixed"  # fixed = only HL_COINS; auto = also scan the exchange for other liquid perps
+    universe_extra: int = 5  # how many scanned coins to research besides the core ones
+    min_volume_usd: float = 5_000_000.0  # a perp needs this much 24h volume to be tradable
+    max_alt_position_pct: float = 150.0  # per-coin cap (% of equity) for coins outside the core list
     confirm_mainnet: bool = False
 
     # --- folders
@@ -109,7 +114,15 @@ def load_settings(env_file: str | None = None) -> Settings:
         raise ValueError(f"HL_MODE must be one of {MODES}, got {mode!r}")
     coins = [c.strip().upper() for c in os.getenv("HL_COINS", "BTC,ETH,SOL").split(",") if c.strip()]
     d = Settings()
+    universe_mode = os.getenv("HL_UNIVERSE", d.universe_mode).strip().lower() or d.universe_mode
+    if universe_mode not in ("fixed", "auto"):
+        raise ValueError("HL_UNIVERSE must be 'fixed' or 'auto'")
     s = Settings(
+        core_coins=list(coins),
+        universe_mode=universe_mode,
+        universe_extra=_int("HL_UNIVERSE_SIZE", d.universe_extra),
+        min_volume_usd=_float("HL_MIN_VOLUME_USD", d.min_volume_usd),
+        max_alt_position_pct=_float("HL_MAX_ALT_POSITION_PCT", d.max_alt_position_pct),
         mode=mode,
         private_key=_read_private_key(),
         account_address=os.getenv("HL_ACCOUNT_ADDRESS", "").strip(),

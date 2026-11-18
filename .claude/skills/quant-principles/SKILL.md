@@ -36,6 +36,14 @@ Working rules drawn from the systematic-trading literature (Carver on forecasts 
 - BTC, ETH and SOL mostly move together. Three trend longs are close to one bet.
 - Rules that make money in different ways diversify far more than one rule on three coins. A few genuinely different bets beat many copies of one.
 
+## 4b. Smaller perps
+
+- More volatile, so the same dollar position is more risk. Size by ATR and give stops room.
+- Short history makes their backtests the least reliable rows. Trend, volume and open interest together are better evidence than a fitted Sharpe on a few months.
+- Funding shows who is crowded: very positive after a run-up is the late-long setup; very negative after a flush often precedes a squeeze.
+- Thin books and listing or delisting news can gap price through a stop. Non-core coins have a tighter hard cap.
+- Trending lists and a wall of headlines mean the crowd has arrived. Check the catalyst with `search_news` before trading a mover you do not understand.
+
 ## 5. Count every cost
 
 - Fees and slippage are about 0.1% per round trip; funding accrues while a position is open; the AI's own token cost is subtracted in `pnl`.

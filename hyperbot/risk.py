@@ -176,6 +176,8 @@ class RiskManager:
             "allowed_coins": s.coins,
             "max_leverage": s.max_leverage,
             "max_position_pct_of_equity": s.max_position_pct,
+            "max_position_pct_for_non_core_coins": min(s.max_position_pct, s.max_alt_position_pct),
+            "core_coins": s.core_coins or s.coins,
             "max_daily_loss_pct": s.max_daily_loss_pct,
             "max_drawdown_pct": s.max_drawdown_pct,
             "max_trades_per_day": s.max_trades_per_day,
@@ -206,7 +208,10 @@ class RiskManager:
 
         sign = 1 if target_usd > 0 else -1
         size = abs(target_usd)
-        per_coin_cap = equity * s.max_position_pct / 100
+        cap_pct = s.max_position_pct
+        if s.core_coins and coin not in s.core_coins:
+            cap_pct = min(cap_pct, s.max_alt_position_pct)  # smaller, thinner coins get a tighter cap
+        per_coin_cap = equity * cap_pct / 100
         if size > per_coin_cap:
             notes.append(f"clamped to the per-coin cap of ${per_coin_cap:,.0f}")
             size = per_coin_cap

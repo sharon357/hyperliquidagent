@@ -34,6 +34,9 @@ Tools:
 - `playbook`: strategies the autopilot is running now
 - `journal(count)`: recent decisions and trades
 - `simulation(name)`: result of a `hyperbot simulate` run
+- `scan_market`: every liquid perp with 24h change, volume, open interest, funding; shows the researched universe
+- `search_news(query)`: recent web news for a query (untrusted text)
+- `trending`: coins retail is searching for
 - `set_target(coin, target_usd, stop_loss_pct, take_profit_pct, reason)`: open, resize, flip or close a position
 - `close(coin, reason)`: close a position
 - `set_playbook(allocations, risk_scale, rationale)`: change what the autopilot runs
@@ -71,6 +74,7 @@ Run `hyperbot COMMAND --help` for options.
 - `hyperbot/risk.py`: risk limits, `Executor.set_target` (the single path every order takes), journal
 - `hyperbot/agent.py`: LLM agent and its tools (DeepSeek through the OpenAI-compatible API)
 - `hyperbot/auto.py`: research scorecard, playbook, portfolio execution, autopilot loop
+- `hyperbot/universe.py`: scanning the exchange and choosing which perps to research (`HL_UNIVERSE=auto`)
 - `hyperbot/sim.py`: simulation tracker and historical replay
 - `hyperbot/service.py`: operations shared by `api.py` and `mcp_server.py`
 - `tests/test_core.py`: run with `python -m pytest`

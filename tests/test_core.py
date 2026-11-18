@@ -637,3 +637,61 @@ def test_manager_can_take_profit_close_and_reenter(stack, monkeypatch):
     assert out["status"] == "executed" and "held_closed" in out
     assert runner.step(auto.load_playbook(s))[0]["status"] == "noop"
     assert not broker.account().positions
+
+
+# ------------------------------------------------------------------ dynamic universe
+class UniverseData(FakeData):
+    def asset_contexts(self):
+        def row(px, chg, vol, delisted=False):
+            return {"mark_px": px, "change_24h_pct": chg, "volume_24h_usd": vol, "open_interest_usd": vol / 2,
+                    "funding_annual_pct": 10.0, "funding_hourly": 0.00001, "max_leverage": 5, "delisted": delisted}
+
+        return {
+            "BTC": row(100, 1, 3e9), "ETH": row(10, 2, 1e9), "HYPE": row(30, 25, 4e8), "DOGE": row(1, -3, 2e8),
+            "TINY": row(0.1, 80, 1e5), "DEAD": row(5, 50, 9e8, delisted=True), "PEPE": row(0.01, -18, 6e7),
+        }
+
+
+def test_universe_scan_and_shortlist():
+    from hyperbot import universe
+
+    rows = universe.scan(UniverseData(), 5e6)
+    coins = [r["coin"] for r in rows]
+    assert coins[0] == "BTC" and "TINY" not in coins and "DEAD" not in coins  # illiquid and delisted are out
+    picks = universe.shortlist(rows, ["BTC", "ETH"], 2)
+    assert picks[:2] == ["BTC", "ETH"] and "HYPE" in picks and len(picks) == 4  # biggest mover is included
+
+
+def test_non_core_coins_get_a_tighter_cap_and_must_be_in_universe(stack):
+    s, data, broker, ex = stack
+    data.prices["HYPE"] = 30.0
+    s.core_coins = ["BTC", "ETH"]
+    s.max_position_pct, s.max_alt_position_pct, s.max_leverage = 300.0, 150.0, 5.0
+    assert ex.set_target("HYPE", 5000, stop_loss_pct=5)["status"] == "rejected"  # not researched yet
+    s.coins.append("HYPE")
+    assert ex.set_target("HYPE", 50_000, stop_loss_pct=5)["approved_target_usd"] == pytest.approx(15_000)
+    assert ex.set_target("BTC", 50_000, stop_loss_pct=5)["approved_target_usd"] == pytest.approx(30_000)
+
+
+def test_manager_can_scan_and_research_a_new_coin(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.universe_mode, s.core_coins, s.research_intervals = "auto", ["BTC", "ETH"], ["4h"]
+    udata = UniverseData()
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=900))
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["ema_cross"])
+    agent = auto.PortfolioAgent(s, ex, udata, client=object(), runner=auto.PortfolioRunner(s, ex))
+    names = {t["name"] for t in agent.tool_defs}
+    assert {"scan_market", "research_coin", "search_news", "get_trending", "close_position", "set_playbook"} <= names
+    scan = agent.tool_scan_market({})
+    assert scan["researched_universe"] == ["BTC", "ETH"] and scan["markets"][0]["coin"] == "BTC"
+    assert "error" in agent.tool_research_coin({"coin": "TINY"})  # too illiquid
+    out = agent.tool_research_coin({"coin": "hype"})
+    assert out["rows"] and out["rows"][0]["coin"] == "HYPE" and "psr" in out["rows"][0]
+    assert "HYPE" in s.coins
+    card = auto.load_scorecard(s)
+    assert card["coins"] == s.coins and any(r["coin"] == "HYPE" for r in card["rows"])
+    s2 = Settings(state_dir=s.state_dir, coins=["BTC", "ETH"], core_coins=["BTC", "ETH"], universe_mode="auto")
+    auto.universe.restore(s2)
+    assert "HYPE" in s2.coins  # survives a restart
