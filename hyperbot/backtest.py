@@ -25,6 +25,8 @@ class BacktestConfig:
     slippage_bps: float = 2.0
     stop_loss_pct: float | None = None  # % from the average entry price
     take_profit_pct: float | None = None
+    trail_pct: float | None = None  # trailing stop: this far behind the best price since entry
+    breakeven_at_pct: float | None = None  # once this far in profit, the stop is at least the entry
     maintenance_margin: float = 0.02  # liquidated when equity < this share of notional
     rebalance_threshold: float = 0.1  # smallest change in target exposure worth trading
     allow_short: bool = True
@@ -74,6 +76,9 @@ def run_backtest(
     slip = cfg.slippage_bps / 1e4
     sl = cfg.stop_loss_pct / 100 if cfg.stop_loss_pct else None
     tp = cfg.take_profit_pct / 100 if cfg.take_profit_pct else None
+    trail = cfg.trail_pct / 100 if cfg.trail_pct else None
+    breakeven = cfg.breakeven_at_pct / 100 if cfg.breakeven_at_pct else None
+    best_px = 0.0  # best price since entry, as of the previous bar (so a bar's high cannot rescue its own low)
     mm = cfg.maintenance_margin
 
     equity = cfg.initial_equity
@@ -87,7 +92,7 @@ def run_backtest(
     open_trade: dict | None = None
 
     def trade_to(desired: float, price: float, i: int, reason: str) -> None:
-        nonlocal equity, units, entry_px, fees, slippage_cost, open_trade
+        nonlocal equity, units, entry_px, fees, slippage_cost, open_trade, best_px
         delta = desired - units
         if delta == 0:
             return
@@ -97,6 +102,7 @@ def run_backtest(
         slippage_cost += notional * slip
         if units == 0:  # opening
             entry_px = price
+            best_px = price
             open_trade = {
                 "entry_time": times[i],
                 "side": "long" if desired > 0 else "short",
@@ -132,18 +138,26 @@ def run_backtest(
         reason = ""
         if long:
             stop_px = entry_px * (1 - sl) if sl else -np.inf
+            if trail:
+                stop_px = max(stop_px, best_px * (1 - trail))
+            if breakeven and best_px >= entry_px * (1 + breakeven):
+                stop_px = max(stop_px, entry_px * 1.001)
             trigger = max(stop_px, liq_px)
             if lo <= trigger:
                 hit_px = min(trigger, hi)
-                reason = "liquidation" if liq_px >= stop_px else "stop_loss"
+                reason = "liquidation" if liq_px >= stop_px else ("trailing_stop" if stop_px > entry_px * (1 - (sl or 1)) else "stop_loss")
             elif tp and hi >= entry_px * (1 + tp):
                 hit_px, reason = max(entry_px * (1 + tp), lo), "take_profit"
         else:
             stop_px = entry_px * (1 + sl) if sl else np.inf
+            if trail:
+                stop_px = min(stop_px, best_px * (1 + trail))
+            if breakeven and best_px <= entry_px * (1 - breakeven):
+                stop_px = min(stop_px, entry_px * 0.999)
             trigger = min(stop_px, liq_px) if liq_px > 0 else stop_px
             if hi >= trigger:
                 hit_px = max(trigger, lo)
-                reason = "liquidation" if 0 < liq_px <= stop_px else "stop_loss"
+                reason = "liquidation" if 0 < liq_px <= stop_px else ("trailing_stop" if stop_px < entry_px * (1 + (sl or 1e9)) else "stop_loss")
             elif tp and lo <= entry_px * (1 - tp):
                 hit_px, reason = min(entry_px * (1 - tp), hi), "take_profit"
         if hit_px is None:
@@ -153,7 +167,7 @@ def run_backtest(
         trade_to(0.0, hit_px, i, reason)
         last_target = 0.0
         if reason != "take_profit":
-            blocked = side
+            blocked = side  # as live: stay out until the signal changes side
         if reason == "liquidation":
             liquidations += 1
 
@@ -180,6 +194,7 @@ def run_backtest(
 
         protect(low[i], h[i], o[i], i)
         if units:
+            best_px = max(best_px, h[i]) if units > 0 else min(best_px, low[i])
             equity += units * (c[i] - o[i])
             pay = units * c[i] * f[i]  # longs pay when funding is positive
             equity -= pay

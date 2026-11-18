@@ -790,7 +790,7 @@ def test_trailing_stop_ratchets_and_survives_playbook_rewrites(stack, monkeypatc
     monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
     monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
     runner = auto.PortfolioRunner(s, ex)
-    alloc = {"coin": "BTC", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": 0, "breakeven_at_pct": 3}
+    alloc = {"coin": "BTC", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": 4, "breakeven_at_pct": 3}
     pb, _ = auto.make_playbook(s, None, [alloc])
     runner.step(pb)
     assert broker.get_protection("BTC")["stop_px"] == pytest.approx(96.0)  # entry 100, 4% stop
@@ -831,7 +831,7 @@ def test_trailing_can_be_switched_off_and_works_for_shorts(stack, monkeypatch):
     monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
     monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
     runner = auto.PortfolioRunner(s, ex)
-    off, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}])
+    off, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0}])  # trailing is off unless asked for
     runner.step(off)
     data.prices["BTC"] = 90.0
     runner.step(off)
@@ -845,3 +845,20 @@ def test_trailing_can_be_switched_off_and_works_for_shorts(stack, monkeypatch):
     data.prices["BTC"] = 80.0
     runner.step(on)
     assert broker.get_protection("BTC")["stop_px"] == pytest.approx(82.4)
+
+
+def test_backtest_trailing_stop_locks_in_profit():
+    # Up 30%, then all the way back down below the entry.
+    up, down = np.linspace(100, 130, 40), np.linspace(130, 80, 60)
+    close = np.concatenate([np.full(5, 100.0), up, down])
+    idx = pd.date_range("2025-01-01", periods=len(close), freq="1h", tz="UTC")
+    open_ = np.concatenate([[100.0], close[:-1]])
+    df = pd.DataFrame({"open": open_, "high": np.maximum(open_, close), "low": np.minimum(open_, close), "close": close, "volume": 1.0, "funding": 0.0}, index=idx)
+    fixed = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0))
+    trailed = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0, trail_pct=10.0, breakeven_at_pct=10.0))
+    assert fixed.trades.iloc[0]["reason"] == "stop_loss" and fixed.metrics["total_return_pct"] == pytest.approx(-10.0, abs=0.5)
+    assert trailed.trades.iloc[0]["reason"] == "trailing_stop"
+    assert trailed.metrics["total_return_pct"] == pytest.approx(17.0, abs=1.0)  # out 10% below the 130 peak
+    # Break-even alone: the winner ends as a scratch instead of a loss.
+    scratch = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0, breakeven_at_pct=10.0))
+    assert scratch.metrics["total_return_pct"] == pytest.approx(0.1, abs=0.2)

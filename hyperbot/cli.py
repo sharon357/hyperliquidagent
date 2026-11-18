@@ -74,13 +74,22 @@ def _load(settings: Settings, coin: str, interval: str, days: float, source: str
     return df
 
 
-def _cfg(settings: Settings, leverage: float, sl: Optional[float], tp: Optional[float]) -> BacktestConfig:
+def _cfg(
+    settings: Settings,
+    leverage: float,
+    sl: Optional[float],
+    tp: Optional[float],
+    trail: Optional[float] = None,
+    breakeven: Optional[float] = None,
+) -> BacktestConfig:
     return BacktestConfig(
         leverage=leverage,
         taker_fee=settings.taker_fee,
         slippage_bps=settings.slippage_bps,
         stop_loss_pct=sl,
         take_profit_pct=tp,
+        trail_pct=trail,
+        breakeven_at_pct=breakeven,
     )
 
 
@@ -157,6 +166,8 @@ def backtest(
     param: Optional[list[str]] = O_PARAM,
     stop_loss: Optional[float] = O_SL,
     take_profit: Optional[float] = O_TP,
+    trail: Optional[float] = typer.Option(None, "--trail", help="Trailing stop distance in percent"),
+    breakeven: Optional[float] = typer.Option(None, "--breakeven", help="Move the stop to entry after this profit in percent"),
     report: bool = typer.Option(True, help="Write an HTML report and a trades CSV to reports/"),
 ):
     """Backtest one strategy on one coin."""
@@ -166,7 +177,7 @@ def backtest(
     coin = coin.upper()
     df = _load(s, coin, interval, days, source, csv)
     strat = get_strategy(strategy, **_params(param))
-    res = run_backtest(df, strat, _cfg(s, leverage, stop_loss, take_profit))
+    res = run_backtest(df, strat, _cfg(s, leverage, stop_loss, take_profit, trail, breakeven))
     console.print(_metrics_table(res.metrics, f"{strat!r} on {coin} {interval}, {len(df)} bars"))
     if report:
         base = s.reports_dir / f"{coin}_{interval}_{strategy}"
