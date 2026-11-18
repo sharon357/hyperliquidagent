@@ -862,3 +862,102 @@ def test_backtest_trailing_stop_locks_in_profit():
     # Break-even alone: the winner ends as a scratch instead of a loss.
     scratch = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0, breakeven_at_pct=10.0))
     assert scratch.metrics["total_return_pct"] == pytest.approx(0.1, abs=0.2)
+
+
+# ------------------------------------------------------------------ overfitting probability, HRP, time limit
+def test_pbo_tells_real_tuning_from_noise():
+    from hyperbot.stats import pbo_cscv
+
+    rng = np.random.default_rng(3)
+    n = 1600
+    noise = pd.DataFrame(rng.normal(0, 0.01, (n, 12)))  # twelve parameter sets, none with any edge
+    real = noise.copy()
+    real[0] += 0.002  # one parameter set that genuinely works, all the time
+    assert pbo_cscv(real)["pbo"] < 0.1
+    assert pbo_cscv(noise)["pbo"] > 0.3  # the in-sample winner is often below the median out-of-sample
+    assert pbo_cscv(noise.iloc[:, :3]) is None  # too few parameter sets to say anything
+
+
+def test_hrp_treats_correlated_bets_as_one():
+    from hyperbot.stats import hrp_weights
+
+    rng = np.random.default_rng(4)
+    market = rng.normal(0, 0.02, 400)
+    frame = pd.DataFrame(
+        {
+            "a": market + rng.normal(0, 0.002, 400),  # three near-copies of the same bet
+            "b": market + rng.normal(0, 0.002, 400),
+            "c": market + rng.normal(0, 0.002, 400),
+            "d": rng.normal(0, 0.02, 400),  # one independent bet of similar volatility
+        }
+    )
+    w = hrp_weights(frame)
+    assert w.sum() == pytest.approx(1.0)
+    assert w["d"] > 0.35  # plain inverse volatility would give it about 0.25
+    assert w[["a", "b", "c"]].max() < w["d"]
+
+
+def test_backtest_time_limit_exits_stale_trades():
+    df = make_df(n=200, drift=0.0)
+    df["funding"] = 0.0
+    res = run_backtest(df, Fixed(1.0), replace_cfg(FREE, max_hold_bars=24))
+    assert len(res.trades) == 1 and res.trades.iloc[0]["reason"] == "time_limit"
+    held = (res.trades.iloc[0]["exit_time"] - res.trades.iloc[0]["entry_time"]) / pd.Timedelta(hours=1)
+    assert held == 24
+
+
+def test_walk_forward_embargo_shortens_training_only():
+    df = make_df(n=1200)
+    grid = {"fast": [10, 20], "slow": [50, 100]}
+    a = walk_forward(df, "ema_cross", BacktestConfig(), grid=grid, n_splits=3, embargo=0)
+    b = walk_forward(df, "ema_cross", BacktestConfig(), grid=grid, n_splits=3, embargo=40)
+    assert [f["test_start"] for f in a["folds"]] == [f["test_start"] for f in b["folds"]]  # test slices are unchanged
+    assert len(b["oos_equity"]) == len(a["oos_equity"])
+
+
+def test_scorecard_has_pbo_and_rule_uses_hrp(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, *_ = stack
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["ema_cross"])
+    rows = auto.score_frame(make_df(n=1500), "BTC", "1h", BacktestConfig(), log=lambda m: None)
+    assert "pbo" in rows[0] and rows[0]["configs_tried"] == 9 and "_oos_daily" in rows[0]
+    returns: dict = {}
+    auto.finalize_rows(rows, returns)
+    assert "_oos_daily" not in rows[0] and "BTC|1h|ema_cross" in returns
+
+    # Three near-identical legs and one independent leg: the rule gives the independent one more.
+    rng = np.random.default_rng(5)
+    days = [str(d.date()) for d in pd.date_range("2026-01-01", periods=120)]
+    market = rng.normal(0.002, 0.02, 120)
+    series = {
+        "BTC|4h|tsmom": market + rng.normal(0, 0.002, 120),
+        "ETH|4h|tsmom": market + rng.normal(0, 0.002, 120),
+        "SOL|4h|tsmom": market + rng.normal(0, 0.002, 120),
+        "HYPE|4h|ou_reversion": rng.normal(0.002, 0.02, 120),
+    }
+    rets = {k: dict(zip(days, map(float, v))) for k, v in series.items()}
+    s.coins[:] = ["BTC", "ETH", "SOL", "HYPE"]
+    base = {"oos_trades": 20, "oos_folds": 3, "oos_folds_positive": 3, "fitted_sharpe": 1.0, "atr_pct": 1.0, "live_params": {}, "interval": "4h", "oos_sharpe": 2.0, "oos_volatility_pct": 30.0}
+    card = {"rows": [{**base, "coin": k.split("|")[0], "strategy": k.split("|")[2]} for k in series]}
+    w = {a["coin"]: a["weight"] for a in auto.rule_based_allocations(s, card, returns=rets)}
+    assert w["HYPE"] > max(w["BTC"], w["ETH"], w["SOL"]) and sum(w.values()) == pytest.approx(1.0)
+    overfit = {"rows": [{**card["rows"][0], "pbo": 0.8}]}
+    assert auto.rule_based_allocations(s, overfit, returns=rets) == []  # overfit tuning is rejected
+
+
+def test_time_limit_closes_a_live_position(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    pb, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0, "max_hold_hours": 6}])
+    assert pb["allocations"][0]["max_hold_hours"] == 6
+    runner.step(pb)
+    assert "BTC" in broker.account().positions
+    runner.state["trail"]["BTC"]["opened"] -= 7 * 3600  # seven hours later
+    runner.step(pb)
+    assert "BTC" not in broker.account().positions
+    assert runner.step(pb)[0]["status"] == "noop"  # and it stays out until the plan changes

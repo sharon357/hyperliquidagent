@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Callable
 
 import numpy as np
+import pandas as pd
 
 from . import indicators as ind
 from . import universe
@@ -29,7 +30,7 @@ from .backtest import BacktestConfig, grid_search, walk_forward
 from .config import Settings
 from .data import HLData, interval_ms, load_history
 from .risk import LIMIT_BOUNDS, Executor, set_limit_overrides, utc_now
-from .stats import expected_max_sharpe, psr_from_stats, sharpe_stats
+from .stats import expected_max_sharpe, hrp_weights, pbo_cscv, psr_from_stats, sharpe_stats
 from .strategies import DISCRETIONARY, get_strategy, tradable_strategies
 
 MAX_ALLOCATIONS = 8
@@ -73,9 +74,12 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
     for name in tradable_strategies():
         grid = get_strategy(name).grid
         try:
-            fitted = grid_search(df, name, cfg).iloc[0]
+            trials: dict = {}
+            fitted = grid_search(df, name, cfg, returns_out=trials).iloc[0]
             params = {k: type(grid[k][0])(fitted[k]) for k in grid}
+            overfit = pbo_cscv(pd.DataFrame(trials))
             wf = walk_forward(df, name, cfg, n_splits=WF_SPLITS)
+            daily = wf["oos_equity"].resample("1D").last().pct_change().dropna()
             signal = float(get_strategy(name, **params).signal(df).iloc[-1])
         except Exception as e:
             log(f"research: {coin} {interval} {name} failed: {e}")
@@ -96,6 +100,10 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
                 "oos_trades": oos["trades"],
                 "oos_folds_positive": sum(f["out_of_sample_return_pct"] > 0 for f in wf["folds"]),
                 "oos_folds": WF_SPLITS,
+                # Probability the tuned parameters are overfit (0 = tuning finds something real, 0.5+ = no better than chance).
+                "pbo": round(overfit["pbo"], 2) if overfit else None,
+                "configs_tried": len(trials),
+                "_oos_daily": {str(d.date()): round(float(v), 5) for d, v in daily.items()},
                 # Fitted: best parameters picked with hindsight on the whole window. Flattering.
                 "fitted_return_pct": float(fitted["total_return_pct"]),
                 "fitted_sharpe": float(fitted["sharpe"]),
@@ -109,8 +117,46 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
     return rows
 
 
-def finalize_rows(rows: list[dict]) -> list[dict]:
+def returns_key(row: dict) -> str:
+    return f"{row['coin']}|{row['interval']}|{row['strategy']}"
+
+
+def _returns_path(settings: Settings) -> Path:
+    return Path(settings.state_dir) / "research_returns.json"
+
+
+def load_returns(settings: Settings) -> dict:
+    """Daily out-of-sample returns of every researched candidate, for correlation and weighting."""
+    return _read(_returns_path(settings)) or {}
+
+
+def portfolio_view(returns: dict, keys: list[str]) -> dict | None:
+    """Correlation matrix and hierarchical-risk-parity weights for a set of candidates."""
+    have = [k for k in keys if returns.get(k)]
+    if len(have) < 2:
+        return None
+    frame = pd.DataFrame({k: pd.Series(returns[k]) for k in have}).fillna(0.0)
+    frame = frame.loc[:, frame.std() > 0]
+    if frame.shape[1] < 2 or len(frame) < 20:
+        return None
+    corr = frame.corr().fillna(0.0)
+    weights = hrp_weights(frame)
+    n = corr.shape[0]
+    return {
+        "days": len(frame),
+        "hrp_weights": {k: round(float(v), 3) for k, v in weights.items()},
+        "average_correlation": round(float((corr.to_numpy().sum() - n) / (n * (n - 1))), 2),
+        "correlation": {a: {b: round(float(corr.loc[a, b]), 2) for b in corr.columns} for a in corr.index},
+        "missing": [k for k in keys if k not in frame.columns],
+    }
+
+
+def finalize_rows(rows: list[dict], returns_out: dict | None = None) -> list[dict]:
     """Add the luck-adjusted statistics, which depend on how many candidates were tested, and sort."""
+    for r in rows:
+        series = r.pop("_oos_daily", None)
+        if returns_out is not None and series:
+            returns_out[returns_key(r)] = series
     stats = [r["_stats"] for r in rows if "_stats" in r]
     # Compare candidates in annualised Sharpe so 1h and 4h rows are judged on the same scale.
     annual = [s["sr"] * np.sqrt(s.get("bars_per_year", 1.0)) for s in stats]
@@ -142,7 +188,9 @@ def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> d
                 continue
             rows.extend(score_frame(df, coin, interval, cfg, log))
             log(f"research: {coin} {interval} done ({len(df)} bars)")
-    finalize_rows(rows)
+    returns: dict = {}
+    finalize_rows(rows, returns)
+    _write(_returns_path(settings), returns)
     card = {
         "coins": list(settings.coins),
         "candidates_tested": len(rows),
@@ -243,6 +291,7 @@ def make_playbook(
                 # trail at the stop distance cost the 4h trend strategies most of their return.
                 "trail_pct": _trail_setting(a.get("trail_pct")),
                 "breakeven_at_pct": _trail_setting(a.get("breakeven_at_pct")),
+                "max_hold_hours": max(_trail_setting(a.get("max_hold_hours")), 0.0) * 1.0 if a.get("max_hold_hours") else 0.0,
                 "oos_sharpe": row["oos_sharpe"] if row else None,
             }
         )
@@ -267,7 +316,9 @@ def make_playbook(
     return playbook, warnings
 
 
-def rule_based_allocations(settings: Settings, scorecard: dict, per_coin: int = 2, budget: float = 1.0) -> list[dict]:
+def rule_based_allocations(
+    settings: Settings, scorecard: dict, per_coin: int = 2, budget: float = 1.0, returns: dict | None = None
+) -> list[dict]:
     """Fallback selection with no LLM.
 
     Pick strategies that held up out-of-sample and are unlikely to be luck, give
@@ -285,6 +336,7 @@ def rule_based_allocations(settings: Settings, scorecard: dict, per_coin: int = 
             and r["oos_folds_positive"] >= 2
             and r["oos_trades"] >= 5
             and r.get("psr", 1.0) >= 0.75
+            and (r.get("pbo") is None or r["pbo"] <= 0.5)  # tuning that is no better than chance is not evidence
         )
         if not ok or count.get(r["coin"], 0) >= per_coin or len(picked) >= MAX_ALLOCATIONS:
             continue
@@ -296,8 +348,13 @@ def rule_based_allocations(settings: Settings, scorecard: dict, per_coin: int = 
     confidence = sum(r.get("psr", 1.0) for r in rows) / len(rows)
     budget = min(budget, settings.max_leverage) * confidence
     inv_vol = [1.0 / max(r.get("oos_volatility_pct") or 1.0, 1e-6) for r in rows]
-    for a, r, iv in zip(picked, rows, inv_vol):
-        weight = budget * iv / sum(inv_vol)
+    shares = [iv / sum(inv_vol) for iv in inv_vol]
+    # Prefer hierarchical risk parity: it sees that correlated picks are one bet, inverse volatility does not.
+    view = portfolio_view(returns if returns is not None else load_returns(settings), [returns_key(r) for r in rows])
+    if view and not view["missing"]:
+        shares = [view["hrp_weights"][returns_key(r)] for r in rows]
+    for a, r, share in zip(picked, rows, shares):
+        weight = budget * share
         a["weight"] = min(weight, max(r.get("half_kelly", weight), 0.0))
     return [a for a in picked if a["weight"] > 0]
 
@@ -326,6 +383,9 @@ class PortfolioRunner:
             t["fraction"] += sig * a["weight"] * playbook.get("risk_scale", 1.0) * self.s.exposure_multiplier
             stops = [x for x in (t["stop_loss_pct"], a["stop_loss_pct"]) if x]
             t["stop_loss_pct"] = min(stops) if stops else 0.0
+            hold = a.get("max_hold_hours") or 0.0
+            if hold > 0 and (not t.get("max_hold_hours") or hold < t["max_hold_hours"]):
+                t["max_hold_hours"] = hold
             for key in ("trail_pct", "breakeven_at_pct"):
                 new, old = a.get(key, 0.0) or 0.0, t.get(key)
                 # tightest explicit setting wins; "off" only if every allocation on the coin says off
@@ -357,7 +417,15 @@ class PortfolioRunner:
             st = {"side": side, "best": pos.mark_px, "stop": None}
         st["entry"] = pos.entry_px
         st["best"] = max(st["best"], pos.mark_px) if side > 0 else min(st["best"], pos.mark_px)
+        st.setdefault("opened", time.time())
         trails[coin] = st
+
+        limit = t.get("max_hold_hours") or 0.0
+        if limit > 0 and time.time() - st["opened"] > limit * 3600:
+            # Time barrier: the move this trade was waiting for has not come in the time allowed.
+            self.executor.set_target(coin, 0.0, source="autopilot", reason=f"time limit of {limit:g}h reached")
+            trails.pop(coin, None)
+            return "closed"
 
         current = self.executor.broker.get_protection(coin)
         live = current.get("stop_px")
@@ -477,9 +545,13 @@ You can read the internet. `search_news` searches recent news for any query (a c
 
 How the pieces work:
 - `get_research` returns a scorecard for every strategy on every coin and timeframe over recent months, costs included. The `oos_*` numbers come from walk-forward testing, where parameters were chosen only on earlier data and then run on unseen data; they are the honest estimate. The `fitted_*` numbers use the best parameters picked with hindsight and are always flattering. Judge by out-of-sample results, and treat a large gap between fitted and out-of-sample as a sign of overfitting.
+- `pbo` is the probability that a row's tuned parameters are overfit. It comes from re-running the parameter search on every half of the history and checking how the winner did on the other half. Near 0 means the tuning keeps finding something that works on unseen data; 0.5 or more means choosing the best backtest was no better than choosing at random, and that row's fitted numbers should be ignored however good they look.
+- The walk-forward tests leave a gap (an embargo) between the data parameters are chosen on and the data they are tested on, so nothing leaks across the boundary.
 - Three columns measure luck. `psr` is the probability that a strategy's true Sharpe ratio is above zero given how short and lumpy its record is. `dsr` is the same probability after allowing for the fact that it is one of `candidates_tested` rows you are choosing among; the best of many worthless strategies always looks good, and `dsr` is what remains after discounting that. `half_kelly` is half the leverage that would maximise long-run growth if the out-of-sample record were the truth, so treat it as a ceiling on that strategy's weight, never a target.
 - Orders below the exchange minimum (`min_order_usd` in the account's risk limits) are skipped, so on a small account a position only exists if weight x risk_scale x equity for that coin clears it. Work out the dollar size before you choose: fewer, larger allocations on one or two coins are the only way a small account can trade at all, and you may use leverage up to `max_leverage` when the evidence and the stop distance justify it.
 - Each allocation can carry a `take_profit_pct`: the position is closed when price has moved that far in its favour. Use it when you expect a move of a particular size (a bounce to a level, a mean-reversion target); leave it at 0 for trend allocations, which make their money by letting winners run.
+- Every trade has three exits, and you set all of them: the stop (the idea is wrong), the take-profit (the idea has paid), and `max_hold_hours` (the idea has run out of time). A trade taken for a specific catalyst or a short-term bounce should carry a time limit: if the move has not come in the window you expected, the reason for the trade is gone even though neither price level was hit. Leave it at 0 for trend allocations.
+- Correlated legs are one bet. Before finalising weights, `analyze_portfolio` shows how the candidates' out-of-sample returns move together and gives hierarchical-risk-parity weights, which split risk across genuinely different bets instead of across tickers. Use it to decide how much is really riding on one view.
 - Stops ratchet. Each allocation has a `trail_pct` (the stop follows the best price at that distance) and a `breakeven_at_pct` (once the trade has been that far in profit, the stop is at least the entry price). The stop only ever moves in the position's favour, and its level is remembered per position: rewriting the playbook, resizing, or setting a wider stop does not move it back. `get_playbook` shows each position's current trailing level under `trailing_stops`. Both are off unless you set them, and for good reason. In a 150-day backtest of every strategy on eight coins, a trail at the stop distance with a break-even step cut the average return of the 4h trend strategies from about +15% to about +1%, because normal pullbacks shook positions out of trends they would otherwise have ridden; break-even alone cost more than half; a trail twice as wide roughly matched a plain stop. Drawdowns were smaller with trailing, and mean-reversion strategies did slightly better with it. So: leave trend allocations on a plain stop (or a trail at least twice the stop distance) and let the strategy's own signal take them out; use a tight trail and early break-even for trades with a defined, limited move (a catalyst pop, a squeeze, a mean-reversion bounce), or when protecting a gain matters more to you than catching the rest of the move.
 - `close_position` closes a coin now and keeps it closed until the strategies flip side or you write a new playbook. Use it to bank a profit or cut a position when your read has changed faster than the strategies will react. Writing a playbook clears every such hold (and any hold left by a stop-out), so that is also how you re-enter.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
@@ -534,8 +606,9 @@ MANAGER_TOOLS = [
                             "take_profit_pct": {"type": "number", "description": "Close the position after this favourable move in percent; 0 for none"},
                             "trail_pct": {"type": "number", "description": "Trailing stop: distance in percent the stop follows behind the best price. 0 = no trailing"},
                             "breakeven_at_pct": {"type": "number", "description": "Once the trade has been this many percent in profit, the stop moves to at least the entry price. 0 = never"},
+                            "max_hold_hours": {"type": "number", "description": "Time limit: close the position if it is still open after this many hours. 0 = no limit"},
                         },
-                        "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct", "take_profit_pct", "trail_pct", "breakeven_at_pct"],
+                        "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct", "take_profit_pct", "trail_pct", "breakeven_at_pct", "max_hold_hours"],
                         "additionalProperties": False,
                     },
                 },
@@ -600,6 +673,28 @@ MANAGER_TOOLS += [
         },
     },
 ]
+MANAGER_TOOLS += [
+    {
+        "name": "analyze_portfolio",
+        "description": "For a set of candidate legs from the scorecard: the correlation of their out-of-sample daily returns and hierarchical-risk-parity weights (shares of risk that treat highly correlated legs as one bet). Use it before finalising weights. Discretionary hold_long / hold_short legs have no return history and are not covered.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "legs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"coin": {"type": "string"}, "interval": {"type": "string"}, "strategy": {"type": "string"}},
+                        "required": ["coin", "interval", "strategy"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["legs"],
+            "additionalProperties": False,
+        },
+    },
+]
 _KEEP = ("get_account", "get_market_overview", "get_quant_signals", "get_sentiment", "get_recent_decisions", "close_position")
 
 
@@ -623,6 +718,14 @@ class PortfolioAgent(TradingAgent):
 
     def _check_coin(self, coin: str) -> str:
         return coin.upper().strip()  # reading signals for any perp is fine; trading is gated by the risk engine
+
+    def tool_analyze_portfolio(self, a: dict) -> dict:
+        keys = [f"{str(x['coin']).upper()}|{x['interval']}|{x['strategy']}" for x in a.get("legs") or []]
+        view = portfolio_view(load_returns(self.s), keys)
+        if view is None:
+            return {"error": "need at least two researched legs with return history", "asked_for": keys}
+        view["note"] = "hrp_weights are shares of the total; multiply by the gross exposure you want. Correlation near 1 means the legs are one bet."
+        return view
 
     def tool_set_risk_limits(self, a: dict) -> dict:
         requested = {k: a.get(k) for k in LIMIT_BOUNDS}
@@ -664,7 +767,9 @@ class PortfolioAgent(TradingAgent):
                 problems.append(f"{interval}: {e}")
         if not rows:
             return {"error": f"could not research {coin}", "problems": problems[:5]}
-        finalize_rows(rows)
+        returns = load_returns(self.s)
+        finalize_rows(rows, returns)
+        _write(_returns_path(self.s), returns)
         if coin not in self.s.coins:
             self.s.coins.append(coin)
             universe.save(self.s)

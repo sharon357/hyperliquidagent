@@ -142,9 +142,10 @@ def replay(
             hist = f[(f.index >= a - lookback) & (f.index < a)]
             if len(hist) >= 250:
                 rows.extend(score_frame(hist, coin, interval, base, log=lambda m: None))
-        finalize_rows(rows)
+        period_returns: dict = {}
+        finalize_rows(rows, period_returns)
         index = {(r["coin"], r["strategy"]): r for r in rows}
-        allocs = rule_based_allocations(settings, {"rows": rows})
+        allocs = rule_based_allocations(settings, {"rows": rows}, returns=period_returns)
         ref = next(iter(frames.values()))
         idx = ref.index[(ref.index >= a) & (ref.index < b)]
         port = pd.Series(0.0, index=idx)

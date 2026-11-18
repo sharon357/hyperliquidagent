@@ -169,6 +169,10 @@ The manager's instructions set an explicit goal: maximise long-run account growt
 The research step and the AI's instructions apply standard results from the systematic-trading literature:
 
 - **Luck adjustment.** Each scorecard row gets `psr` (the chance its true Sharpe ratio is above zero, given how short and lumpy the record is) and `dsr` (the same after allowing for how many candidates were tested). With a few months of data `dsr` is low for almost everything, which is the honest state of the evidence.
+- **Overfitting probability.** Each row also gets `pbo`: the parameter search is repeated on every half of the history and the winner is checked on the other half. `pbo` is how often that winner lands in the bottom half on unseen data. At 0.5 or more, picking the best backtest was no better than chance, and the fallback rule rejects the row.
+- **Embargo.** Walk-forward tests leave a gap between the data parameters are chosen on and the data they are tested on.
+- **Three exits per trade.** Stop, take-profit and a time limit (`max_hold_hours`, or `max_hold_bars` in backtests).
+- **Correlation-aware weights.** Picks are weighted by hierarchical risk parity on their out-of-sample returns, so several look-alike bets share one bet's worth of risk.
 - **Risk-based weights.** The fallback rule requires `psr` of at least 0.75, weights picks inversely to their volatility, shrinks total exposure by average confidence, and caps each weight at half its Kelly leverage.
 - **Forecast strategies.** `forecast_trend` and `carry_trend` blend several signals into one conviction score and size the position to a volatility target. `ou_reversion` only fades moves when the estimated half-life of deviations is short. `meta_trend` only bets while the trend rule itself has recently been making money.
 - **Context for AI clients.** The same principles are in the autopilot manager's prompt and in `.claude/skills/quant-principles/SKILL.md`, which Claude Code loads when working in this folder.

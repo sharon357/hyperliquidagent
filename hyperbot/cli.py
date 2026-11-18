@@ -485,14 +485,14 @@ def _show_scorecard(card: dict, top: int) -> None:
         return
     df["live_params"] = df["live_params"].map(lambda p: ", ".join(f"{k}={v}" for k, v in p.items()))
     df["folds+"] = df["oos_folds_positive"].astype(str) + "/" + df["oos_folds"].astype(str)
-    cols = ["coin", "interval", "strategy", "oos_return_pct", "oos_sharpe", "psr", "dsr", "half_kelly", "oos_max_dd_pct", "folds+",
+    cols = ["coin", "interval", "strategy", "oos_return_pct", "oos_sharpe", "psr", "dsr", "pbo", "half_kelly", "oos_max_dd_pct", "folds+",
             "oos_trades", "fitted_return_pct", "current_signal", "live_params"]
     cols = [c for c in cols if c in df.columns]
     console.print(_table(df[cols].head(top), f"Research scorecard ({card['generated']}, {card['days']:g} days): top {min(top, len(df))} of {len(df)} by out-of-sample Sharpe"))
     console.print(
         "oos = walk-forward on unseen data (the honest number); fitted = best parameters picked with hindsight.\n"
         "psr = chance the true Sharpe is above zero; dsr = the same after allowing for how many candidates were tested; "
-        "half_kelly = leverage ceiling for that strategy."
+        "half_kelly = leverage ceiling for that strategy; pbo = probability the tuned parameters are overfit (0.5+ = no better than chance)."
     )
 
 

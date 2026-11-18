@@ -11,6 +11,8 @@ Working rules drawn from the systematic-trading literature (Carver on forecasts 
 
 - Trust `oos_*` (walk-forward on unseen data). `fitted_*` is hindsight and always flatters.
 - `psr` is the chance the true Sharpe is above zero given the record's length and lumpiness. `dsr` is that chance after allowing for how many candidates were tested (`candidates_tested`). With a few months of data `dsr` is low for nearly everything: that is the honest state of the evidence, and the response is small size, not a search for a better-looking row.
+- `pbo` is the probability a row's tuned parameters are overfit. At 0.5 or more, ignore its fitted numbers. On recent data more than half of all rows fail this.
+- Use `analyze_portfolio` before weighting: legs whose out-of-sample returns are highly correlated are one bet.
 - One spectacular row is weak evidence. The same kind of rule working across coins and timeframes is stronger.
 - Every extra parameter, filter or re-run after seeing results is another trial. Do not tune thresholds against the replay.
 - Check where the profit came from. If two periods or three trades produced most of it, the result is fragile.
