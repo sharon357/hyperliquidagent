@@ -564,3 +564,45 @@ def test_ai_cost_is_subtracted_from_profit(stack):
 
     data.prices["BTC"] = 99.0  # a trading loss gets bigger once the AI bill is added
     assert ex.risk.pnl(ex.account().equity)["net_pnl_usd"] == pytest.approx(-50.0 - 40.0)
+
+
+# ------------------------------------------------------------------ luck-adjusted statistics
+def test_sharpe_statistics_separate_edge_from_luck():
+    from hyperbot.stats import deflated_sharpe, expected_max_sharpe, half_kelly, probabilistic_sharpe
+
+    rng = np.random.default_rng(0)
+    edge = pd.Series(rng.normal(0.002, 0.01, 2000))  # real edge, long record
+    noise = pd.Series(rng.normal(0.0, 0.01, 2000))
+    short = edge.iloc[:60]
+    assert probabilistic_sharpe(edge) > 0.99
+    assert 0.05 < probabilistic_sharpe(noise) < 0.95
+    assert probabilistic_sharpe(short) < probabilistic_sharpe(edge)  # same edge, less evidence
+    # The more candidates you tried, the higher the bar and the lower the deflated figure.
+    assert expected_max_sharpe(100, 0.001) > expected_max_sharpe(10, 0.001) > 0
+    assert deflated_sharpe(short, 200, 0.02) < deflated_sharpe(short, 2, 0.02) <= probabilistic_sharpe(short)
+    assert half_kelly(edge) == pytest.approx(0.5 * edge.mean() / edge.var(), rel=1e-9)
+    assert half_kelly(-edge) < 0
+
+
+def test_rule_weights_use_risk_parity_confidence_and_kelly(stack):
+    from hyperbot.auto import finalize_rows, rule_based_allocations
+    from hyperbot.stats import sharpe_stats
+
+    s, *_ = stack
+    rng = np.random.default_rng(1)
+    base = {"oos_trades": 20, "oos_folds": 3, "oos_folds_positive": 3, "fitted_sharpe": 1.0, "atr_pct": 1.0, "live_params": {}, "interval": "4h"}
+    calm = pd.Series(rng.normal(0.003, 0.01, 800))
+    wild = pd.Series(rng.normal(0.006, 0.04, 800))
+    dud = pd.Series(rng.normal(-0.0005, 0.01, 800))  # slightly losing: must be rejected
+    rows = finalize_rows(
+        [
+            {**base, "coin": "BTC", "strategy": "tsmom", "oos_sharpe": 3.0, "oos_volatility_pct": 20.0, "_stats": sharpe_stats(calm)},
+            {**base, "coin": "ETH", "strategy": "ema_cross", "oos_sharpe": 2.0, "oos_volatility_pct": 80.0, "_stats": sharpe_stats(wild)},
+            {**base, "coin": "ETH", "strategy": "macd", "oos_sharpe": 0.6, "oos_volatility_pct": 20.0, "_stats": sharpe_stats(dud)},
+        ]
+    )
+    assert all("_stats" not in r and 0 <= r["dsr"] <= r["psr"] <= 1 for r in rows)
+    allocs = {a["strategy"]: a["weight"] for a in rule_based_allocations(s, {"rows": rows})}
+    assert "macd" not in allocs  # no evidence it beats zero
+    assert allocs["tsmom"] == pytest.approx(4 * allocs["ema_cross"], rel=0.01)  # a quarter of the volatility, four times the weight
+    assert sum(allocs.values()) <= 1.0

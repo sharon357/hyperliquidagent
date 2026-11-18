@@ -26,6 +26,7 @@ from .backtest import BacktestConfig, grid_search, walk_forward
 from .config import Settings
 from .data import interval_ms, load_history
 from .risk import Executor, utc_now
+from .stats import expected_max_sharpe, psr_from_stats, sharpe_stats
 from .strategies import get_strategy, tradable_strategies
 
 MAX_ALLOCATIONS = 8
@@ -70,6 +71,8 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
                 # Out-of-sample: parameters were chosen on earlier data only. This is the honest number.
                 "oos_return_pct": oos["total_return_pct"],
                 "oos_sharpe": oos["sharpe"],
+                "oos_volatility_pct": oos["volatility_pct"],
+                "_stats": {**sharpe_stats(wf["oos_equity"].pct_change()), "bars_per_year": 365 * 86_400_000 / interval_ms(interval)},
                 "oos_max_dd_pct": oos["max_drawdown_pct"],
                 "oos_trades": oos["trades"],
                 "oos_folds_positive": sum(f["out_of_sample_return_pct"] > 0 for f in wf["folds"]),
@@ -86,6 +89,26 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
     return rows
 
 
+def finalize_rows(rows: list[dict]) -> list[dict]:
+    """Add the luck-adjusted statistics, which depend on how many candidates were tested, and sort."""
+    stats = [r["_stats"] for r in rows if "_stats" in r]
+    # Compare candidates in annualised Sharpe so 1h and 4h rows are judged on the same scale.
+    annual = [s["sr"] * np.sqrt(s.get("bars_per_year", 1.0)) for s in stats]
+    variance = float(np.var(annual, ddof=1)) if len(stats) > 1 else 0.0
+    hurdle = expected_max_sharpe(len(stats), variance)  # best annual Sharpe expected from this many duds
+    for r in rows:
+        st = r.pop("_stats", None)
+        if st is None:
+            continue
+        # psr: chance the true Sharpe is above zero. dsr: the same after allowing for
+        # having picked from len(rows) candidates. half_kelly: leverage cap for the sleeve.
+        r["psr"] = round(psr_from_stats(st), 3)
+        r["dsr"] = round(psr_from_stats(st, hurdle / np.sqrt(st.get("bars_per_year", 1.0))), 3)
+        r["half_kelly"] = round(0.5 * st["sr"] / st["sd"], 2) if st["sd"] > 0 else 0.0
+    rows.sort(key=lambda r: r["oos_sharpe"], reverse=True)
+    return rows
+
+
 def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> dict:
     """Backtest + walk-forward every strategy on every coin and research timeframe."""
     cfg = BacktestConfig(taker_fee=settings.taker_fee, slippage_bps=settings.slippage_bps)
@@ -99,8 +122,9 @@ def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> d
                 continue
             rows.extend(score_frame(df, coin, interval, cfg, log))
             log(f"research: {coin} {interval} done ({len(df)} bars)")
-    rows.sort(key=lambda r: r["oos_sharpe"], reverse=True)
+    finalize_rows(rows)
     card = {
+        "candidates_tested": len(rows),
         "generated": utc_now().isoformat(timespec="seconds"),
         "days": settings.research_days,
         "costs": "taker fee, slippage and funding included; 1x leverage",
@@ -197,8 +221,15 @@ def make_playbook(
 
 
 def rule_based_allocations(settings: Settings, scorecard: dict, per_coin: int = 2, budget: float = 1.0) -> list[dict]:
-    """Fallback selection with no LLM: strategies that held up out-of-sample, equal weight."""
+    """Fallback selection with no LLM.
+
+    Pick strategies that held up out-of-sample and are unlikely to be luck, give
+    each the same share of risk (weights inversely proportional to volatility),
+    shrink the total by how confident the statistics are, and never give a sleeve
+    more than half its Kelly leverage.
+    """
     picked: list[dict] = []
+    rows: list[dict] = []
     count: dict[str, int] = {}
     for r in scorecard["rows"]:  # already sorted by out-of-sample Sharpe
         ok = (
@@ -206,15 +237,22 @@ def rule_based_allocations(settings: Settings, scorecard: dict, per_coin: int = 
             and r["fitted_sharpe"] > 0
             and r["oos_folds_positive"] >= 2
             and r["oos_trades"] >= 5
+            and r.get("psr", 1.0) >= 0.75
         )
         if not ok or count.get(r["coin"], 0) >= per_coin or len(picked) >= MAX_ALLOCATIONS:
             continue
         count[r["coin"]] = count.get(r["coin"], 0) + 1
         picked.append({"coin": r["coin"], "interval": r["interval"], "strategy": r["strategy"]})
-    budget = min(budget, settings.max_leverage)
-    for a in picked:
-        a["weight"] = budget / len(picked)
-    return picked
+        rows.append(r)
+    if not picked:
+        return picked
+    confidence = sum(r.get("psr", 1.0) for r in rows) / len(rows)
+    budget = min(budget, settings.max_leverage) * confidence
+    inv_vol = [1.0 / max(r.get("oos_volatility_pct") or 1.0, 1e-6) for r in rows]
+    for a, r, iv in zip(picked, rows, inv_vol):
+        weight = budget * iv / sum(inv_vol)
+        a["weight"] = min(weight, max(r.get("half_kelly", weight), 0.0))
+    return [a for a in picked if a["weight"] > 0]
 
 
 # ------------------------------------------------------------------ execution
@@ -285,12 +323,16 @@ MANAGER_PROMPT = """You manage an automated trading account on Hyperliquid perpe
 
 How the pieces work:
 - `get_research` returns a scorecard for every strategy on every coin and timeframe over recent months, costs included. The `oos_*` numbers come from walk-forward testing, where parameters were chosen only on earlier data and then run on unseen data; they are the honest estimate. The `fitted_*` numbers use the best parameters picked with hindsight and are always flattering. Judge by out-of-sample results, and treat a large gap between fitted and out-of-sample as a sign of overfitting.
+- Three columns measure luck. `psr` is the probability that a strategy's true Sharpe ratio is above zero given how short and lumpy its record is. `dsr` is the same probability after allowing for the fact that it is one of `candidates_tested` rows you are choosing among; the best of many worthless strategies always looks good, and `dsr` is what remains after discounting that. `half_kelly` is half the leverage that would maximise long-run growth if the out-of-sample record were the truth, so treat it as a ceiling on that strategy's weight, never a target.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
 - Each cycle starts fresh. Your memory is the journal (`get_recent_decisions`) and the current playbook (`get_playbook`), so put your reasoning and what would change your mind in the rationale and in your final report.
 
 What good management looks like:
-- Prefer strategies with a positive out-of-sample Sharpe, profit in most folds, and enough trades to mean something. A handful of months is a small sample: one spectacular row is more likely luck than edge, while the same kind of strategy working across several coins and timeframes is better evidence.
-- Diversify across coins and across strategy types when the evidence supports it, and keep total weight modest. Around 1x total is a reasonable ceiling unless the evidence is unusually strong; the drawdowns in the scorecard tell you what a weight will feel like.
+- Prefer strategies with a positive out-of-sample Sharpe, profit in most folds, a high `psr`, and enough trades to mean something. A handful of months is a small sample: one spectacular row is more likely luck than edge, while the same kind of strategy working across several coins and timeframes is better evidence. With this little history `dsr` will usually be low for everything; read that as a reason to keep total size small, and prefer the rows where it is highest.
+- Think in risk, not dollars. Give each allocation a similar share of risk by weighting it inversely to its volatility (`oos_volatility_pct`), so one wild strategy does not dominate. Strategies that make money in different ways (trend, carry, mean reversion) diversify each other far more than the same rule on three correlated coins: BTC, ETH and SOL mostly move together, so three trend-following longs are closer to one bet than three.
+- Size for survival. Never weight an allocation above its `half_kelly`, and keep total weight modest: around 1x is a reasonable ceiling unless the evidence is unusually strong. Estimated edges are always overstated, and over-betting a real edge still ends in ruin; the drawdowns in the scorecard tell you what a weight will feel like.
+- A strategy's recent profit is partly the market regime it happened to meet. Trend rules earn in sustained moves and bleed in ranges; mean reversion is the reverse and can lose heavily in a crash. Ask what regime the record came from and whether the quant signals suggest it is still in force.
+- Costs compound. A strategy with many trades needs a clearly larger edge than one that trades rarely, and fast timeframes pay more in fees and funding for the same idea.
 - If nothing has held up out-of-sample, an empty or very small playbook is the correct answer. Being flat costs nothing.
 - Use the market overview, quant signals and sentiment to set `risk_scale` and to break ties, not to override the research. Extreme readings are often contrarian: extreme greed with very positive funding marks crowded longs, extreme fear with negative funding marks crowded shorts.
 - Keep the playbook stable. Change it when the research has been refreshed, when a strategy in it has clearly stopped working, or when conditions have genuinely shifted. If the current playbook is still the right one, leave it alone and say so; rewriting it every cycle only adds trading costs.

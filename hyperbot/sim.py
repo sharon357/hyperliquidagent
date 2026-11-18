@@ -19,7 +19,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from .auto import _default_stop, _read, _write, rule_based_allocations, score_frame
+from .auto import _default_stop, _read, _write, finalize_rows, rule_based_allocations, score_frame
 from .backtest import BacktestConfig, compute_metrics, run_backtest
 from .config import Settings
 from .data import interval_ms, load_history
@@ -142,7 +142,7 @@ def replay(
             hist = f[(f.index >= a - lookback) & (f.index < a)]
             if len(hist) >= 250:
                 rows.extend(score_frame(hist, coin, interval, base, log=lambda m: None))
-        rows.sort(key=lambda r: r["oos_sharpe"], reverse=True)
+        finalize_rows(rows)
         index = {(r["coin"], r["strategy"]): r for r in rows}
         allocs = rule_based_allocations(settings, {"rows": rows})
         ref = next(iter(frames.values()))

@@ -3,7 +3,7 @@
 A command-line trading bot for Hyperliquid perpetuals:
 
 - **Backtesting** with fees, slippage, funding, leverage, stops and liquidation, plus parameter search and walk-forward testing.
-- **Ten strategies** (trend, momentum, breakout, mean reversion, funding carry, regime switching, ensemble).
+- **Fourteen strategies** (trend, momentum, breakout, mean reversion, funding carry, regime switching, ensemble, plus volatility-targeted forecast blends, a half-life-gated reversion rule and a self-checking trend rule).
 - **An LLM agent** (DeepSeek by default) that reads quant signals, recent strategy performance and market sentiment, then manages positions.
 - **A risk engine in plain code** that every order passes through. The agent cannot exceed it.
 - **Three modes**: `paper` (simulated fills at real prices, the default), `testnet`, `mainnet`.
@@ -147,6 +147,17 @@ curl -X POST localhost:8787/v1/set_target -H 'content-type: application/json'   
 
 Set `HL_API_TOKEN` to require `Authorization: Bearer <token>`; the API refuses to listen on a public address without it. `llms.txt` describes the tools and rules for AI agents.
 
+## How strategies are judged and sized
+
+The research step and the AI's instructions apply standard results from the systematic-trading literature:
+
+- **Luck adjustment.** Each scorecard row gets `psr` (the chance its true Sharpe ratio is above zero, given how short and lumpy the record is) and `dsr` (the same after allowing for how many candidates were tested). With a few months of data `dsr` is low for almost everything, which is the honest state of the evidence.
+- **Risk-based weights.** The fallback rule requires `psr` of at least 0.75, weights picks inversely to their volatility, shrinks total exposure by average confidence, and caps each weight at half its Kelly leverage.
+- **Forecast strategies.** `forecast_trend` and `carry_trend` blend several signals into one conviction score and size the position to a volatility target. `ou_reversion` only fades moves when the estimated half-life of deviations is short. `meta_trend` only bets while the trend rule itself has recently been making money.
+- **Context for AI clients.** The same principles are in the autopilot manager's prompt and in `.claude/skills/quant-principles/SKILL.md`, which Claude Code loads when working in this folder.
+
+These are ideas implemented from scratch; no book text is included.
+
 ## Net profit after AI cost
 
 Every LLM call's tokens are priced and added to a running bill, and profit is reported after subtracting it:
@@ -216,6 +227,7 @@ hyperbot/
   exchange.py    paper and live brokers         risk.py        limits, executor, journal
   agent.py       LLM agent and its tools        runner.py      loops and the strategy runner
   auto.py        autopilot: research, playbook, portfolio execution
+  stats.py       probabilistic and deflated Sharpe, Kelly
   report.py      HTML reports                   cli.py         commands
   sim.py         simulation tracker and replay  service.py     operations behind the API and MCP server
   api.py         HTTP API                       mcp_server.py  MCP server

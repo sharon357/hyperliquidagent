@@ -253,3 +253,120 @@ class Ensemble(Strategy):
 
 def tradable_strategies() -> list[str]:
     return [n for n in REGISTRY if n != "buy_hold"]
+
+
+# ---------------------------------------------------------------------------
+# Strategies built on ideas from the systematic-trading literature.
+# ---------------------------------------------------------------------------
+def _ann_vol(df: pd.DataFrame, window: int = 72) -> pd.Series:
+    return ind.realized_vol(df["close"], window, YEAR_MS / infer_interval_ms(df))
+
+
+def _scaled_forecast(raw: pd.Series) -> pd.Series:
+    """Rescale a raw signal so its long-run average size is 10, capped at +/-20.
+
+    The scale uses only past values (an expanding average), so it never looks ahead.
+    """
+    scale = raw.abs().expanding(min_periods=50).mean().replace(0, np.nan)
+    return (10.0 * raw / scale).clip(-20, 20)
+
+
+def _trend_forecast(df: pd.DataFrame, speeds: tuple[int, ...]) -> pd.Series:
+    """Average of several EMA-crossover forecasts, each measured in units of price volatility."""
+    c = df["close"]
+    price_vol = c.diff().ewm(span=36, min_periods=36).std().replace(0, np.nan)
+    parts = [_scaled_forecast((ind.ema(c, f) - ind.ema(c, 4 * f)) / price_vol) for f in speeds]
+    combined = pd.concat(parts, axis=1).mean(axis=1, skipna=False)
+    # Averaging partly-correlated forecasts shrinks them; scale back up, then cap.
+    return (combined * 1.15).clip(-20, 20)
+
+
+def _carry_forecast(df: pd.DataFrame, window: int) -> pd.Series:
+    """Funding carry per unit of risk: positive when being long is paid."""
+    if "funding" not in df.columns or not df["funding"].abs().sum():
+        return pd.Series(0.0, index=df.index)
+    bars_per_year = YEAR_MS / infer_interval_ms(df)
+    carry = -df["funding"].rolling(window).mean() * bars_per_year  # longs receive when funding is negative
+    return _scaled_forecast(carry / _ann_vol(df).replace(0, np.nan))
+
+
+def _forecast_to_position(forecast: pd.Series, df: pd.DataFrame, target_vol: float, allow_short: bool) -> pd.Series:
+    """Position = conviction (forecast / 10) x volatility scaling, in quarter steps to limit churn."""
+    size = (target_vol / _ann_vol(df).replace(0, np.nan)).clip(upper=1.5)
+    pos = (forecast / 10.0 * size).clip(-1, 1)
+    pos = ((pos * 4).round() / 4).fillna(0.0)
+    return pos if allow_short else pos.clip(lower=0)
+
+
+@register
+class ForecastTrend(Strategy):
+    name = "forecast_trend"
+    description = "Several trend speeds blended into one conviction score, sized so the position targets a fixed volatility."
+    defaults = {"speeds": "8,16,32,64", "target_vol": 0.5, "allow_short": True}
+    grid = {"speeds": ["8,16,32,64", "16,32,64", "4,8,16,32"], "target_vol": [0.3, 0.5, 0.8]}
+
+    def signal(self, df):
+        p = self.params
+        speeds = tuple(int(x) for x in str(p["speeds"]).split(","))
+        return _forecast_to_position(_trend_forecast(df, speeds), df, p["target_vol"], p["allow_short"])
+
+
+@register
+class CarryTrend(Strategy):
+    name = "carry_trend"
+    description = "Blend of trend and funding carry: follow the trend, lean toward the side that gets paid funding."
+    defaults = {"carry_weight": 0.4, "carry_window": 24, "target_vol": 0.5, "allow_short": True}
+    grid = {"carry_weight": [0.2, 0.4, 0.6], "carry_window": [24, 72], "target_vol": [0.3, 0.5]}
+
+    def signal(self, df):
+        p = self.params
+        trend = _trend_forecast(df, (8, 16, 32, 64))
+        carry = _carry_forecast(df, int(p["carry_window"]))
+        blend = ((1 - p["carry_weight"]) * trend + p["carry_weight"] * carry).clip(-20, 20)
+        return _forecast_to_position(blend, df, p["target_vol"], p["allow_short"])
+
+
+@register
+class OuReversion(Strategy):
+    name = "ou_reversion"
+    description = "Mean reversion that only trades when prices are measurably mean-reverting (short estimated half-life)."
+    defaults = {"window": 100, "max_half_life": 30, "entry": 1.5, "allow_short": True}
+    grid = {"window": [50, 100, 200], "max_half_life": [15, 30, 60], "entry": [1.5, 2.0]}
+
+    def signal(self, df):
+        p = self.params
+        w = int(p["window"])
+        x = np.log(df["close"])
+        dev = x - x.rolling(w).mean()
+        lag = dev.shift(1)
+        # AR(1) coefficient of the deviation: below 1 means it is pulled back to the mean.
+        phi = dev.rolling(w).cov(lag) / lag.rolling(w).var().replace(0, np.nan)
+        half_life = -np.log(2) / np.log(phi.where((phi > 0) & (phi < 1)))
+        reverting = half_life < p["max_half_life"]
+        z = dev / dev.rolling(w).std().replace(0, np.nan)
+        pos = _stateful(
+            _b((z < -p["entry"]) & reverting), _b(z >= 0), _b((z > p["entry"]) & reverting), _b(z <= 0), p["allow_short"]
+        )
+        return pd.Series(pos, index=df.index)
+
+
+@register
+class MetaTrend(Strategy):
+    name = "meta_trend"
+    description = "Trend following with a second opinion: bets only while the trend rule itself has recently been making money, sized by how well."
+    defaults = {"fast": 20, "slow": 100, "window": 120, "allow_short": True}
+    grid = {"fast": [10, 20], "slow": [50, 100], "window": [60, 120, 240]}
+
+    def signal(self, df):
+        p = self.params
+        if p["fast"] >= p["slow"]:
+            return pd.Series(0.0, index=df.index)
+        c = df["close"]
+        primary = np.sign(ind.ema(c, p["fast"]) - ind.ema(c, p["slow"])).fillna(0.0)
+        # What the trend rule earned on each bar, using the position it held coming into the bar.
+        earned = primary.shift(1) * c.pct_change()
+        w = int(p["window"])
+        t_stat = earned.rolling(w).mean() / earned.rolling(w).std().replace(0, np.nan) * np.sqrt(w)
+        size = (t_stat / 2.0).clip(0, 1)  # zero when the rule has been losing, full at a t-stat of 2
+        sig = (primary * (size * 4).round() / 4).fillna(0.0)
+        return sig if p["allow_short"] else sig.clip(lower=0)
