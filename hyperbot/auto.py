@@ -197,6 +197,7 @@ def make_playbook(
                 "params": params,
                 "weight": min(weight, settings.max_position_pct / 100),
                 "stop_loss_pct": round(float(np.clip(float(stop), 0.5, settings.max_stop_loss_pct)), 2),
+                "take_profit_pct": round(float(np.clip(float(a.get("take_profit_pct") or 0), 0.0, 50.0)), 2),
                 "oos_sharpe": row["oos_sharpe"] if row else None,
             }
         )
@@ -273,7 +274,10 @@ class PortfolioRunner:
             days = 800 * interval_ms(a["interval"]) / 86_400_000
             df = load_history(a["coin"], a["interval"], days, self.s.data_dir)
             sig = float(get_strategy(a["strategy"], **a["params"]).signal(df).iloc[-1])
-            t = out.setdefault(a["coin"], {"fraction": 0.0, "stop_loss_pct": a["stop_loss_pct"], "parts": []})
+            t = out.setdefault(a["coin"], {"fraction": 0.0, "stop_loss_pct": a["stop_loss_pct"], "take_profit_pct": 0.0, "parts": []})
+            tp = a.get("take_profit_pct") or 0.0
+            if tp and (not t["take_profit_pct"] or tp < t["take_profit_pct"]):
+                t["take_profit_pct"] = tp  # the nearest target among this coin's allocations
             t["fraction"] += sig * a["weight"] * playbook.get("risk_scale", 1.0) * self.s.exposure_multiplier
             t["stop_loss_pct"] = min(t["stop_loss_pct"], a["stop_loss_pct"])
             t["parts"].append(f"{a['strategy']}@{a['interval']}={sig:+.2f}")
@@ -306,6 +310,7 @@ class PortfolioRunner:
                 coin,
                 frac * acct.equity if sign else 0.0,
                 stop_loss_pct=t["stop_loss_pct"],
+                take_profit_pct=t.get("take_profit_pct") or None,
                 source="autopilot",
                 reason=", ".join(t["parts"]) or "not in the playbook",
                 refresh_protection=False,
@@ -322,20 +327,25 @@ class PortfolioRunner:
 # ------------------------------------------------------------------ the LLM portfolio manager
 MANAGER_PROMPT = """You manage an automated trading account on Hyperliquid perpetual futures. You do not place trades yourself. You write the playbook: the list of rule-based strategies the system runs, on which coins and timeframes, and at what weight. An execution engine then follows those strategies' signals bar by bar, and a risk engine written in ordinary code caps leverage, position size, daily loss and drawdown. Nobody reviews your playbook before it trades, so choose as carefully as someone allocating their own money.
 
+The owner's mandate: grow the account, with judgment. They want neither timidity nor recklessness. Sitting flat while there is a candidate with real out-of-sample support is a failure of the job just as over-betting a thin one is. Take more risk when several independent lines of evidence agree and you are confident, less when they are mixed, and none when nothing qualifies. You decide when to open, add, reduce, take profit, close and re-enter; they do not want to be asked.
+
 How the pieces work:
 - `get_research` returns a scorecard for every strategy on every coin and timeframe over recent months, costs included. The `oos_*` numbers come from walk-forward testing, where parameters were chosen only on earlier data and then run on unseen data; they are the honest estimate. The `fitted_*` numbers use the best parameters picked with hindsight and are always flattering. Judge by out-of-sample results, and treat a large gap between fitted and out-of-sample as a sign of overfitting.
 - Three columns measure luck. `psr` is the probability that a strategy's true Sharpe ratio is above zero given how short and lumpy its record is. `dsr` is the same probability after allowing for the fact that it is one of `candidates_tested` rows you are choosing among; the best of many worthless strategies always looks good, and `dsr` is what remains after discounting that. `half_kelly` is half the leverage that would maximise long-run growth if the out-of-sample record were the truth, so treat it as a ceiling on that strategy's weight, never a target.
 - Orders below the exchange minimum (`min_order_usd` in the account's risk limits) are skipped, so on a small account a position only exists if weight x risk_scale x equity for that coin clears it. Work out the dollar size before you choose: fewer, larger allocations on one or two coins are the only way a small account can trade at all, and you may use leverage up to `max_leverage` when the evidence and the stop distance justify it.
+- Each allocation can carry a `take_profit_pct`: the position is closed when price has moved that far in its favour. Use it when you expect a move of a particular size (a bounce to a level, a mean-reversion target); leave it at 0 for trend allocations, which make their money by letting winners run.
+- `close_position` closes a coin now and keeps it closed until the strategies flip side or you write a new playbook. Use it to bank a profit or cut a position when your read has changed faster than the strategies will react. Writing a playbook clears every such hold (and any hold left by a stop-out), so that is also how you re-enter.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
 - Each cycle starts fresh. Your memory is the journal (`get_recent_decisions`) and the current playbook (`get_playbook`), so put your reasoning and what would change your mind in the rationale and in your final report.
 
 What good management looks like:
 - Prefer strategies with a positive out-of-sample Sharpe, profit in most folds, a high `psr`, and enough trades to mean something. A handful of months is a small sample: one spectacular row is more likely luck than edge, while the same kind of strategy working across several coins and timeframes is better evidence. With this little history `dsr` will usually be low for everything; read that as a reason to keep total size small, and prefer the rows where it is highest.
 - Think in risk, not dollars. Give each allocation a similar share of risk by weighting it inversely to its volatility (`oos_volatility_pct`), so one wild strategy does not dominate. Strategies that make money in different ways (trend, carry, mean reversion) diversify each other far more than the same rule on three correlated coins: BTC, ETH and SOL mostly move together, so three trend-following longs are closer to one bet than three.
-- Size for survival. Never weight an allocation above its `half_kelly`, and keep total weight modest: around 1x is a reasonable ceiling unless the evidence is unusually strong. Estimated edges are always overstated, and over-betting a real edge still ends in ruin; the drawdowns in the scorecard tell you what a weight will feel like.
+- Scale size with conviction. Around 1x total exposure suits ordinary, reasonably supported setups. Go above it, toward `max_leverage`, only when the best candidates have strong out-of-sample statistics, several timeframes and evidence types agree, and the stop keeps the loss on a wrong call to a few percent of equity. Drop well below 1x when the evidence is thin or sentiment is at a contrarian extreme against you. Never weight an allocation above its `half_kelly`: estimated edges are overstated, and over-betting a real edge still ends in ruin. The drawdowns in the scorecard tell you what a weight will feel like.
+- Manage open positions actively. Each cycle, look at unrealised PnL and what has changed. Bank part or all of a profit that has reached your target or run into a level where the move is stretched; cut a loser whose thesis has broken without waiting for the stop; add only to positions that are working and still supported.
 - A strategy's recent profit is partly the market regime it happened to meet. Trend rules earn in sustained moves and bleed in ranges; mean reversion is the reverse and can lose heavily in a crash. Ask what regime the record came from and whether the quant signals suggest it is still in force.
 - Costs compound. A strategy with many trades needs a clearly larger edge than one that trades rarely, and fast timeframes pay more in fees and funding for the same idea.
-- If nothing has held up out-of-sample, an empty or very small playbook is the correct answer. Being flat costs nothing.
+- If nothing has held up out-of-sample, an empty playbook is the correct answer. But flat is a position too: it has an opportunity cost, so do not hide in it when a candidate clears the bar. A small account that can only place one meaningful position should still place it when the evidence is there.
 - Use the market overview, quant signals and sentiment to set `risk_scale` and to break ties, not to override the research. Extreme readings are often contrarian: extreme greed with very positive funding marks crowded longs, extreme fear with negative funding marks crowded shorts.
 - Keep the playbook stable. Change it when the research has been refreshed, when a strategy in it has clearly stopped working, or when conditions have genuinely shifted. If the current playbook is still the right one, leave it alone and say so; rewriting it every cycle only adds trading costs.
 
@@ -373,8 +383,9 @@ MANAGER_TOOLS = [
                             "strategy": {"type": "string"},
                             "weight": {"type": "number", "description": "Fraction of equity this strategy controls at full signal, e.g. 0.25"},
                             "stop_loss_pct": {"type": "number", "description": "Stop distance in percent; 0 to use three times ATR"},
+                            "take_profit_pct": {"type": "number", "description": "Close the position after this favourable move in percent; 0 for none"},
                         },
-                        "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct"],
+                        "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct", "take_profit_pct"],
                         "additionalProperties": False,
                     },
                 },
@@ -386,13 +397,13 @@ MANAGER_TOOLS = [
         },
     },
 ]
-_KEEP = ("get_account", "get_market_overview", "get_quant_signals", "get_sentiment", "get_recent_decisions")
+_KEEP = ("get_account", "get_market_overview", "get_quant_signals", "get_sentiment", "get_recent_decisions", "close_position")
 
 
 class PortfolioAgent(TradingAgent):
     system_prompt = MANAGER_PROMPT
     tool_defs = [t for t in TOOLS if t["name"] in _KEEP] + MANAGER_TOOLS
-    action_tools = ("set_playbook",)
+    action_tools = ("set_playbook", "close_position")
     task = "Review the research, the current playbook and the market, update the playbook if it should change, then write your report."
     journal_kind = "manager_cycle"
 
@@ -416,7 +427,21 @@ class PortfolioAgent(TradingAgent):
             live = {"error": str(e)}
         return {"playbook": pb, "live_targets": live, "blocked_after_stop": self.runner.state["blocked"]}
 
+    def tool_close_position(self, a: dict) -> dict:
+        coin = str(a["coin"]).upper()
+        pos = self.executor.account().positions.get(coin)
+        result = self.executor.set_target(coin, 0.0, source="manager", reason=str(a.get("reason", ""))[:500])
+        if pos and result.get("status") == "executed":
+            # Hold the coin closed until the strategies change side or a new playbook is written.
+            self.runner.state["blocked"][coin] = 1 if pos.size > 0 else -1
+            self.runner.state["applied"].pop(coin, None)
+            _write(self.runner.path, self.runner.state)
+            result["held_closed"] = "until the strategies flip side or you set a new playbook"
+        return result
+
     def tool_set_playbook(self, a: dict) -> dict:
+        self.runner.state["blocked"].clear()  # a new decision supersedes earlier stop-outs and manual closes
+        _write(self.runner.path, self.runner.state)
         pb, warnings = make_playbook(
             self.s, load_scorecard(self.s), a.get("allocations") or [], a.get("risk_scale", 1.0), a.get("rationale", ""), source="llm"
         )

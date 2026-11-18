@@ -606,3 +606,34 @@ def test_rule_weights_use_risk_parity_confidence_and_kelly(stack):
     assert "macd" not in allocs  # no evidence it beats zero
     assert allocs["tsmom"] == pytest.approx(4 * allocs["ema_cross"], rel=0.01)  # a quarter of the volatility, four times the weight
     assert sum(allocs.values()) <= 1.0
+
+
+def test_manager_can_take_profit_close_and_reenter(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["tsmom"])
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: None)
+    runner = auto.PortfolioRunner(s, ex)
+    agent = auto.PortfolioAgent(s, ex, data, client=object(), runner=runner)
+    alloc = {"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 4}
+
+    agent.tool_set_playbook({"allocations": [alloc], "risk_scale": 1.0, "rationale": "r"})
+    runner.step(auto.load_playbook(s))
+    assert broker.get_protection("BTC") == {"stop_px": pytest.approx(95.0), "tp_px": pytest.approx(104.0)}
+
+    data.prices["BTC"] = 105.0  # take-profit hit: banked, and not re-bought on the next tick
+    runner.step(auto.load_playbook(s))
+    assert "BTC" not in broker.account().positions
+    assert broker.account().equity == pytest.approx(10_250)
+    assert runner.step(auto.load_playbook(s))[0]["status"] == "noop"
+
+    agent.tool_set_playbook({"allocations": [alloc], "risk_scale": 1.0, "rationale": "re-enter"})  # a new decision re-opens
+    assert runner.step(auto.load_playbook(s))[0]["status"] == "executed"
+
+    out = agent.tool_close_position({"coin": "BTC", "reason": "bank it"})  # manual close holds the coin closed
+    assert out["status"] == "executed" and "held_closed" in out
+    assert runner.step(auto.load_playbook(s))[0]["status"] == "noop"
+    assert not broker.account().positions
