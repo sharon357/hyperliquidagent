@@ -985,3 +985,39 @@ def test_default_wide_trail_protects_a_big_winner(stack, monkeypatch):
     # A trade can still opt out.
     off, _ = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_short", "weight": 0.2, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}])
     assert off["allocations"][0]["trail_pct"] == -1.0
+
+
+def test_stop_out_triggers_an_immediate_review_with_cooldown(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    s.max_daily_loss_pct, s.max_drawdown_pct = 50.0, 80.0  # keep the loss limits out of this test's way
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    reviews = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="": (reviews.append(event), original(c, fresh, event))[1])
+
+    pilot.tick()
+    assert "BTC" in broker.account().positions and reviews == [""]  # the first, routine review
+    pilot.tick()
+    assert len(reviews) == 1  # nothing happened: no extra review
+
+    data.prices["BTC"] = 90.0  # through the stop
+    pilot.tick()
+    assert "BTC" not in broker.account().positions
+    assert len(reviews) == 2 and "BTC long was closed" in reviews[1]
+
+    # A second stop-out straight afterwards waits for the cooldown.
+    auto.make_playbook(s, card, [{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.5, "stop_loss_pct": 3}])
+    pilot.runner.state["blocked"].clear()
+    pilot.tick()
+    assert "BTC" in broker.account().positions
+    data.prices["BTC"] = 80.0
+    pilot.tick()
+    assert "BTC" not in broker.account().positions and len(reviews) == 2

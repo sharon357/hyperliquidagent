@@ -369,6 +369,7 @@ class PortfolioRunner:
         self.executor = executor
         self.path = Path(settings.state_dir) / "auto_state.json"
         self.state = _read(self.path) or {"applied": {}, "blocked": {}}
+        self.review_requested: str | None = None  # set when a stop, target or time limit closes a position
 
     def targets(self, playbook: dict) -> dict[str, dict]:
         """Net target exposure per coin (as a fraction of equity) and the stop to use."""
@@ -486,6 +487,9 @@ class PortfolioRunner:
             if applied.get(coin, 0) != 0 and cur == 0:
                 blocked[coin] = applied[coin]
                 self.executor.journal.write("stopped_out", coin=coin, side=applied[coin])
+                side_word = "long" if applied[coin] > 0 else "short"
+                self.review_requested = f"the {coin} {side_word} was closed on the exchange by its stop-loss or take-profit"
+
             frac = t["fraction"]
             sign = int(np.sign(frac)) if abs(frac) >= 0.01 else 0
             if blocked.get(coin):
@@ -505,6 +509,8 @@ class PortfolioRunner:
             now = self.executor.broker.account().positions.get(coin) if not self.executor.dry_run else None
             if not self.executor.dry_run and self._trail(coin, t, now) == "closed":
                 blocked[coin] = int(np.sign(now.size))  # exited on the trailing stop: stay out like any stop-out
+                side_word = "long" if now.size > 0 else "short"
+                self.review_requested = f"the {coin} {side_word} was closed by its trailing stop or time limit"
                 now = None
             applied[coin] = int(np.sign(now.size)) if now else 0
             if applied[coin] == 0 and not blocked.get(coin):
@@ -875,6 +881,8 @@ class AutoPilot:
         self.runner = PortfolioRunner(settings, executor)
         self.last_review = 0.0
         self.last_review_equity = 0.0
+        self.last_event_review = 0.0
+        self.event_cooldown = 30 * 60  # at most one stop-triggered review per half hour
         self._agent: PortfolioAgent | None = None
         universe.restore(settings)
 
@@ -887,8 +895,8 @@ class AutoPilot:
         self.executor.journal.write("playbook", source="rules", allocations=pb["allocations"], warnings=warnings)
         self.log(f"playbook set by rules: {len(pb['allocations'])} allocation(s)" + ("" if pb["allocations"] else " (nothing passed the bar, staying flat)"))
 
-    def manage(self, card: dict, fresh_research: bool) -> None:
-        """Let the LLM (or the fallback rule) decide the playbook."""
+    def manage(self, card: dict, fresh_research: bool, event: str = "") -> None:
+        """Let the LLM (or the fallback rule) decide the playbook. `event` says why, if it is not a routine review."""
         self.last_review = time.time()
         if not self.use_llm:
             if fresh_research or load_playbook(self.s) is None:
@@ -897,6 +905,13 @@ class AutoPilot:
         try:
             if self._agent is None:
                 self._agent = PortfolioAgent(self.s, self.executor, runner=self.runner, on_event=self.on_event, lock=self.lock)
+            self._agent.task = PortfolioAgent.task
+            if event:
+                self._agent.task = (
+                    f"This is an unscheduled review because {event}. Work out why it happened and whether the reason for "
+                    "the trade is finished or has reversed, then decide what the account should hold now: stay out, "
+                    "re-enter the same way, or take the other side. " + PortfolioAgent.task
+                )
             summary = self._agent.run_cycle()
             self.log(f"manager report (AI cost ${summary['cost_usd']:.4f}, ended: {summary['stop_reason']}):\n" + summary["report"])
         except AgentError as e:
@@ -942,4 +957,14 @@ class AutoPilot:
             self.last_review_equity = equity
             self.manage(card, fresh)
         with self.lock:  # only the part that trades holds the account lock
-            return self.runner.step(load_playbook(self.s))
+            results = self.runner.step(load_playbook(self.s))
+        event, self.runner.review_requested = self.runner.review_requested, None
+        if event and time.time() - self.last_event_review >= self.event_cooldown:
+            # A position was closed without the manager choosing it: decide straight away what comes
+            # next instead of sitting flat until the scheduled review.
+            self.last_event_review = time.time()
+            self.log(f"{event}: reviewing now")
+            self.manage(card, False, event=event)
+            with self.lock:
+                results = self.runner.step(load_playbook(self.s))
+        return results
