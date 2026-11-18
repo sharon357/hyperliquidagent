@@ -129,6 +129,10 @@ Any OpenAI-compatible API works: change `HL_LLM_BASE_URL`, `HL_AGENT_MODEL` and 
 3. Set `HL_MODE=testnet` first and run for a while. The live order path has only been checked read-only here, so testnet is where you confirm fills, stops and leverage behave as expected.
 4. For real money set `HL_MODE=mainnet` and pass `--live` (or `HL_CONFIRM_MAINNET=yes` for Docker).
 
+Unified accounts (USDC held on the spot side and used directly as perp collateral) are detected automatically. Testnet and mainnet keep their risk state and journal in `state/testnet` and `state/mainnet`, apart from the paper account.
+
+Hyperliquid's minimum order is $10. On a very small account, trade one coin (`HL_COINS=BTC`) and raise `HL_MAX_LEVERAGE`, `HL_MAX_POSITION_PCT` and `HL_EXPOSURE_MULTIPLIER` so a position can reach that size; otherwise orders are skipped as too small.
+
 The private key is read by the bot process only. The LLM never sees it: the model can only call the tools in `hyperbot/agent.py`.
 
 ## Use it from Claude Code (MCP) or over HTTP

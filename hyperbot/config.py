@@ -62,6 +62,7 @@ class Settings:
     default_stop_loss_pct: float = 3.0
     max_stop_loss_pct: float = 10.0
     rebalance_band: float = 0.10  # ignore resizes smaller than 10 % of the position
+    exposure_multiplier: float = 1.0  # autopilot only: scales every playbook position (still capped by max_leverage)
 
     # --- LLM agent (any OpenAI-compatible API; DeepSeek by default)
     llm_api_key: str = field(default="", repr=False)
@@ -113,7 +114,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         account_address=os.getenv("HL_ACCOUNT_ADDRESS", "").strip(),
         coins=coins,
         confirm_mainnet=_bool("HL_CONFIRM_MAINNET", False),
-        state_dir=Path(os.getenv("HL_STATE_DIR", "state")),
+        # Real accounts keep their own risk state and journal, apart from the paper account's.
+        state_dir=Path(os.getenv("HL_STATE_DIR", "state")) / ("" if mode == "paper" else mode),
         data_dir=Path(os.getenv("HL_DATA_DIR", "data")),
         reports_dir=Path(os.getenv("HL_REPORTS_DIR", "reports")),
         taker_fee=_float("HL_TAKER_FEE", d.taker_fee),
@@ -131,6 +133,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         default_stop_loss_pct=_float("HL_DEFAULT_STOP_LOSS_PCT", d.default_stop_loss_pct),
         max_stop_loss_pct=_float("HL_MAX_STOP_LOSS_PCT", d.max_stop_loss_pct),
         rebalance_band=_float("HL_REBALANCE_BAND", d.rebalance_band),
+        exposure_multiplier=_float("HL_EXPOSURE_MULTIPLIER", d.exposure_multiplier),
         llm_api_key=(os.getenv("HL_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip(),
         llm_base_url=os.getenv("HL_LLM_BASE_URL", d.llm_base_url).strip() or d.llm_base_url,
         agent_model=os.getenv("HL_AGENT_MODEL", d.agent_model).strip() or d.agent_model,

@@ -820,7 +820,7 @@ def doctor():
             from .exchange import HyperliquidBroker
 
             b = HyperliquidBroker(s)
-            return f"account {b.address[:6]}...{b.address[-4:]} equity ${b.account().equity:,.2f}"
+            return f"account {b.address[:6]}...{b.address[-4:]} ({b.abstraction}) equity ${b.account().equity:,.2f}"
 
         check(f"{s.mode} account", live_check)
     else:

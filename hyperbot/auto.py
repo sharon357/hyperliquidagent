@@ -273,7 +273,7 @@ class PortfolioRunner:
             df = load_history(a["coin"], a["interval"], days, self.s.data_dir)
             sig = float(get_strategy(a["strategy"], **a["params"]).signal(df).iloc[-1])
             t = out.setdefault(a["coin"], {"fraction": 0.0, "stop_loss_pct": a["stop_loss_pct"], "parts": []})
-            t["fraction"] += sig * a["weight"] * playbook.get("risk_scale", 1.0)
+            t["fraction"] += sig * a["weight"] * playbook.get("risk_scale", 1.0) * self.s.exposure_multiplier
             t["stop_loss_pct"] = min(t["stop_loss_pct"], a["stop_loss_pct"])
             t["parts"].append(f"{a['strategy']}@{a['interval']}={sig:+.2f}")
         return out

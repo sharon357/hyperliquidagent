@@ -378,9 +378,23 @@ class HyperliquidBroker(Broker):
         self._sz_decimals = {a["name"]: int(a["szDecimals"]) for a in universe}
         self._max_leverage = {a["name"]: int(a.get("maxLeverage", 1)) for a in universe}
         self._leverage_set: set[str] = set()
+        # Unified accounts (and portfolio margin) keep their USDC on the spot side and
+        # use it directly as perp collateral, so the perp-only summary reads zero.
+        try:
+            self.abstraction = str(self.info.post("/info", {"type": "userAbstraction", "user": self.address}))
+        except Exception:
+            self.abstraction = "unknown"
+        self.unified = self.abstraction in ("unifiedAccount", "portfolioMargin")
 
     def mids(self) -> dict[str, float]:
         return {k: float(v) for k, v in self.info.all_mids().items()}
+
+    def _spot_usdc(self) -> tuple[float, float]:
+        """(total, on hold) USDC on the spot side."""
+        for b in self.info.spot_user_state(self.address).get("balances", []):
+            if b.get("coin") == "USDC":
+                return float(b.get("total", 0)), float(b.get("hold", 0))
+        return 0.0, 0.0
 
     def account(self) -> AccountState:
         st = self.info.user_state(self.address)
@@ -401,9 +415,15 @@ class HyperliquidBroker(Broker):
                 float(p.get("unrealizedPnl") or 0),
                 float(liq) if liq else None,
             )
-        return AccountState(
-            float(ms["accountValue"]), float(st.get("withdrawable", 0)), float(ms["totalMarginUsed"]), positions
-        )
+        equity = float(ms["accountValue"])
+        margin = float(ms["totalMarginUsed"])
+        free = float(st.get("withdrawable", 0))
+        if self.unified:
+            # Collateral is the spot USDC; the perp summary then only carries open-position PnL.
+            usdc, hold = self._spot_usdc()
+            equity += usdc
+            free = max(usdc - hold - margin, 0.0)
+        return AccountState(equity, free, margin, positions)
 
     def _round_size(self, coin: str, units: float) -> float:
         return round(abs(units), self._sz_decimals.get(coin, 4))
