@@ -746,3 +746,38 @@ def test_deposits_do_not_distort_daily_loss_or_drawdown(tmp_path):
     rm.update(17.0, net_deposits=20.8)  # withdrawing $10 is not a drawdown
     assert not rm.state["halted"]
     assert rm.pnl(17.0, 20.8)["trading_pnl_usd"] == pytest.approx(-3.8)
+
+
+def test_ai_can_set_its_own_limits_within_outer_bounds(stack, monkeypatch):
+    from hyperbot import auto
+    from hyperbot.risk import LIMIT_BOUNDS, set_limit_overrides
+
+    s, data, broker, ex = stack
+    assert "error" in set_limit_overrides(s, {"max_leverage": 10})  # off unless the owner allows it
+    s.ai_sets_limits = True
+    agent = auto.PortfolioAgent(s, ex, data, client=object(), runner=auto.PortfolioRunner(s, ex))
+    out = agent.tool_set_risk_limits(
+        {"max_leverage": 8, "max_position_pct": 500, "max_daily_loss_pct": 99, "max_drawdown_pct": 0,
+         "max_trades_per_day": 0, "max_stop_loss_pct": 25, "require_stop": False, "rationale": "concentrated plan"}
+    )
+    assert out["applied"]["max_leverage"] == 8 and s.max_leverage == 8
+    assert s.max_daily_loss_pct == LIMIT_BOUNDS["max_daily_loss_pct"][1]  # 99% clamped to the outer bound
+    assert s.max_drawdown_pct == 20.0  # 0 = unchanged
+    assert s.require_stop is False and out["limits_now"]["stop_loss_required"] is False
+
+    # No-stop positions are now possible, and the bigger cap is live.
+    r = ex.set_target("BTC", 60_000, stop_loss_pct=None)
+    assert r["status"] == "executed" and r["approved_target_usd"] == pytest.approx(50_000) and r["stop_px"] is None
+    assert broker.get_protection("BTC").get("stop_px") is None
+
+    # The choice survives a restart.
+    s2 = Settings(state_dir=s.state_dir, coins=["BTC", "ETH"], ai_sets_limits=True)
+    RiskManager(s2)
+    assert s2.max_leverage == 8 and s2.require_stop is False
+
+    # A playbook can ask for no stop only while stops are optional.
+    pb, _ = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": -1, "take_profit_pct": 0}])
+    assert pb["allocations"][0]["stop_loss_pct"] == 0.0
+    s.require_stop = True
+    pb, warnings = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": -1, "take_profit_pct": 0}])
+    assert pb["allocations"][0]["stop_loss_pct"] > 0 and warnings

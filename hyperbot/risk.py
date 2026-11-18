@@ -20,6 +20,66 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# The AI manager may move the risk limits, but only inside these outer bounds. They are
+# deliberately not adjustable by the model: text it reads from the internet could try to
+# talk it into switching protection off, and this is what still stands if that works.
+LIMIT_BOUNDS = {
+    "max_leverage": (1.0, 20.0),
+    "max_position_pct": (50.0, 2000.0),
+    "max_alt_position_pct": (25.0, 2000.0),
+    "max_daily_loss_pct": (2.0, 50.0),
+    "max_drawdown_pct": (5.0, 80.0),
+    "max_trades_per_day": (5, 100),
+    "max_stop_loss_pct": (2.0, 50.0),
+}
+
+
+def _overrides_path(settings: Settings) -> Path:
+    return Path(settings.state_dir) / "risk_overrides.json"
+
+
+def apply_limit_overrides(settings: Settings) -> dict:
+    """Load limits the AI manager set earlier onto the live settings. Returns what was applied."""
+    p = _overrides_path(settings)
+    if not settings.ai_sets_limits or not p.is_file():
+        return {}
+    saved = json.loads(p.read_text(encoding="utf-8"))
+    for key, value in saved.get("limits", {}).items():
+        if key in LIMIT_BOUNDS or key == "require_stop":
+            setattr(settings, key, value)
+    return saved
+
+
+def set_limit_overrides(settings: Settings, requested: dict, rationale: str = "") -> dict:
+    """Change risk limits at the AI manager's request, clamped to LIMIT_BOUNDS."""
+    if not settings.ai_sets_limits:
+        return {"error": "the owner has fixed the risk limits (HL_AI_SETS_LIMITS is off)"}
+    applied, notes = {}, []
+    for key, (lo, hi) in LIMIT_BOUNDS.items():
+        if requested.get(key) in (None, "", 0):
+            continue
+        try:
+            value = float(requested[key])
+        except (TypeError, ValueError):
+            notes.append(f"{key}: not a number, ignored")
+            continue
+        clamped = min(max(value, lo), hi)
+        if clamped != value:
+            notes.append(f"{key}: {value:g} is outside the allowed range, set to {clamped:g}")
+        applied[key] = int(clamped) if isinstance(lo, int) else clamped
+    if isinstance(requested.get("require_stop"), bool):
+        applied["require_stop"] = requested["require_stop"]
+    for key, value in applied.items():
+        setattr(settings, key, value)
+    p = _overrides_path(settings)
+    saved = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {"limits": {}}
+    saved["limits"].update(applied)
+    saved.update(updated=utc_now().isoformat(timespec="seconds"), rationale=str(rationale)[:800])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    return {"status": "saved", "applied": applied, "notes": notes, "outer_bounds": LIMIT_BOUNDS}
+
+
 class AICostLedger:
     """Running total of what the LLM has cost, kept next to the account it trades."""
 
@@ -94,6 +154,7 @@ class RiskManager:
         self.s = settings
         self.path = Path(settings.state_dir) / "risk_state.json"
         self.state = self._load()
+        apply_limit_overrides(settings)
 
     def _load(self) -> dict:
         if self.path.is_file():
@@ -198,6 +259,8 @@ class RiskManager:
             "max_trades_per_day": s.max_trades_per_day,
             "min_order_usd": s.min_order_usd,
             "max_stop_loss_pct": s.max_stop_loss_pct,
+            "stop_loss_required": s.require_stop,
+            "limits_set_by": "the AI manager, inside fixed outer bounds" if s.ai_sets_limits else "the owner",
             "autopilot_exposure_multiplier": s.exposure_multiplier,
         }
 
@@ -283,9 +346,13 @@ class Executor:
 
         if target_usd != 0:
             if not stop_loss_pct or stop_loss_pct <= 0:
-                stop_loss_pct = s.default_stop_loss_pct
-                result["note_stop"] = f"no stop given, using the default {stop_loss_pct}%"
-            if stop_loss_pct > s.max_stop_loss_pct:
+                if s.require_stop:
+                    stop_loss_pct = s.default_stop_loss_pct
+                    result["note_stop"] = f"no stop given, using the default {stop_loss_pct}%"
+                else:
+                    stop_loss_pct = None
+                    result["note_stop"] = "no stop-loss on this position"
+            if stop_loss_pct and stop_loss_pct > s.max_stop_loss_pct:
                 stop_loss_pct = s.max_stop_loss_pct
                 result["note_stop"] = f"stop clamped to the maximum {stop_loss_pct}%"
 
@@ -311,7 +378,9 @@ class Executor:
             result.update(status="noop", detail="already flat")
             return result
 
-        if not trade_needed and not refresh_protection and self.broker.get_protection(coin).get("stop_px"):
+        if not trade_needed and not refresh_protection and (
+            not stop_loss_pct or self.broker.get_protection(coin).get("stop_px")
+        ):
             # Leave the existing stop where it is: re-placing it every tick would
             # drag it away from a falling price and it would never trigger.
             result.update(status="hold")
@@ -358,12 +427,14 @@ class Executor:
             pos = self.broker.account().positions.get(coin)
             if pos:
                 long = pos.size > 0
-                stop_px = pos.mark_px * (1 - stop_loss_pct / 100 if long else 1 + stop_loss_pct / 100)
+                stop_px = None
+                if stop_loss_pct:
+                    stop_px = pos.mark_px * (1 - stop_loss_pct / 100 if long else 1 + stop_loss_pct / 100)
                 tp_px = None
                 if take_profit_pct and take_profit_pct > 0:
                     tp_px = pos.mark_px * (1 + take_profit_pct / 100 if long else 1 - take_profit_pct / 100)
                 errors = self.broker.set_protection(coin, stop_px, tp_px)
-                result["stop_px"] = round(stop_px, 6)
+                result["stop_px"] = round(stop_px, 6) if stop_px else None
                 result["take_profit_px"] = round(tp_px, 6) if tp_px else None
                 if errors:
                     result["protection_errors"] = errors

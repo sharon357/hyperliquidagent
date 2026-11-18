@@ -67,6 +67,8 @@ class Settings:
     default_stop_loss_pct: float = 3.0
     max_stop_loss_pct: float = 10.0
     rebalance_band: float = 0.10  # ignore resizes smaller than 10 % of the position
+    require_stop: bool = True  # every position must carry a stop-loss
+    ai_sets_limits: bool = False  # let the AI manager change the risk limits itself, inside fixed outer bounds
     exposure_multiplier: float = 1.0  # autopilot only: scales every playbook position (still capped by max_leverage)
 
     # --- LLM agent (any OpenAI-compatible API; DeepSeek by default)
@@ -147,6 +149,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         default_stop_loss_pct=_float("HL_DEFAULT_STOP_LOSS_PCT", d.default_stop_loss_pct),
         max_stop_loss_pct=_float("HL_MAX_STOP_LOSS_PCT", d.max_stop_loss_pct),
         rebalance_band=_float("HL_REBALANCE_BAND", d.rebalance_band),
+        require_stop=_bool("HL_REQUIRE_STOP", d.require_stop),
+        ai_sets_limits=_bool("HL_AI_SETS_LIMITS", d.ai_sets_limits),
         exposure_multiplier=_float("HL_EXPOSURE_MULTIPLIER", d.exposure_multiplier),
         llm_api_key=(os.getenv("HL_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip(),
         llm_base_url=os.getenv("HL_LLM_BASE_URL", d.llm_base_url).strip() or d.llm_base_url,
