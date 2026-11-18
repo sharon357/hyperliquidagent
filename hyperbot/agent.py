@@ -264,7 +264,7 @@ class TradingAgent:
                 model=self.s.agent_model,
                 messages=messages,
                 tools=openai_tools(self.tool_defs),
-                max_tokens=8000,
+                max_tokens=self.s.agent_max_tokens,  # includes the model's reasoning tokens
                 extra_body=extra,
             )
         except AuthenticationError as e:
@@ -312,6 +312,8 @@ class TradingAgent:
             if not calls:
                 stop_reason = choice.finish_reason or "stop"
                 report = text
+                if stop_reason == "length" and not text:
+                    report = "(the model ran out of output tokens before finishing; raise HL_AGENT_MAX_TOKENS or lower HL_AGENT_EFFORT)"
                 break
 
             assistant: dict = {

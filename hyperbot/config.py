@@ -70,6 +70,7 @@ class Settings:
     agent_model: str = "deepseek-v4-pro"
     agent_effort: str = "high"  # DeepSeek thinking effort: low | high | max ("" = do not send)
     agent_max_steps: int = 25
+    agent_max_tokens: int = 32000  # per model call, reasoning included
     # LLM prices in USD per 1M tokens (defaults: deepseek-v4-pro peak rates; off-peak is half)
     llm_price_input: float = 1.32
     llm_price_input_cached: float = 0.044
@@ -139,6 +140,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         agent_model=os.getenv("HL_AGENT_MODEL", d.agent_model).strip() or d.agent_model,
         agent_effort=os.getenv("HL_AGENT_EFFORT", d.agent_effort).strip(),
         agent_max_steps=_int("HL_AGENT_MAX_STEPS", d.agent_max_steps),
+        agent_max_tokens=_int("HL_AGENT_MAX_TOKENS", d.agent_max_tokens),
         llm_price_input=_float("HL_LLM_PRICE_INPUT", d.llm_price_input),
         llm_price_input_cached=_float("HL_LLM_PRICE_INPUT_CACHED", d.llm_price_input_cached),
         llm_price_output=_float("HL_LLM_PRICE_OUTPUT", d.llm_price_output),

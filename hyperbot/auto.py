@@ -462,7 +462,7 @@ class AutoPilot:
             if self._agent is None:
                 self._agent = PortfolioAgent(self.s, self.executor, runner=self.runner, on_event=self.on_event)
             summary = self._agent.run_cycle()
-            self.log(f"manager report (AI cost ${summary['cost_usd']:.4f}):\n" + summary["report"])
+            self.log(f"manager report (AI cost ${summary['cost_usd']:.4f}, ended: {summary['stop_reason']}):\n" + summary["report"])
         except AgentError as e:
             self.log(f"LLM manager unavailable: {e}")
             if load_playbook(self.s) is None:
