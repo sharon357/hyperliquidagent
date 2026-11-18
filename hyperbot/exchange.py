@@ -389,6 +389,28 @@ class HyperliquidBroker(Broker):
     def mids(self) -> dict[str, float]:
         return {k: float(v) for k, v in self.info.all_mids().items()}
 
+    def net_deposits(self) -> float | None:
+        """USDC paid into the account minus USDC taken out, from the exchange's ledger."""
+        try:
+            ledger = self.info.post("/info", {"type": "userNonFundingLedgerUpdates", "user": self.address, "startTime": 0})
+        except Exception:
+            return None
+        me = self.address.lower()
+        total = 0.0
+        for entry in ledger:
+            d = entry.get("delta", {})
+            kind = d.get("type")
+            if kind == "deposit":
+                total += float(d.get("usdc", 0))
+            elif kind == "withdraw":
+                total -= float(d.get("usdc", 0)) + float(d.get("fee", 0))
+            elif kind in ("send", "internalTransfer", "spotTransfer"):
+                if d.get("token", "USDC") != "USDC":
+                    continue
+                amount = float(d.get("amount") or d.get("usdc") or 0)
+                total += amount if str(d.get("destination", "")).lower() == me else -amount
+        return total
+
     def _spot_usdc(self) -> tuple[float, float]:
         """(total, on hold) USDC on the spot side."""
         for b in self.info.spot_user_state(self.address).get("balances", []):
@@ -419,10 +441,12 @@ class HyperliquidBroker(Broker):
         margin = float(ms["totalMarginUsed"])
         free = float(st.get("withdrawable", 0))
         if self.unified:
-            # Collateral is the spot USDC; the perp summary then only carries open-position PnL.
+            # Verified on a live account: the spot USDC total is the whole account value. It already
+            # includes margin lent to open positions (reported as "hold") and their unrealised PnL,
+            # so the perp summary must not be added on top.
             usdc, hold = self._spot_usdc()
-            equity += usdc
-            free = max(usdc - hold - margin, 0.0)
+            equity = usdc
+            free = max(usdc - hold, 0.0)
         return AccountState(equity, free, margin, positions)
 
     def _round_size(self, coin: str, units: float) -> float:

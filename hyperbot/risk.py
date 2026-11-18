@@ -131,9 +131,13 @@ class RiskManager:
             self.state["high_water_mark"] = equity  # restart drawdown tracking from here
         self._save()
 
-    def pnl(self, equity: float) -> dict:
-        """Profit and loss since the bot first saw the account, before and after the LLM bill."""
-        base = self.state.get("baseline_equity") or equity
+    def pnl(self, equity: float, net_deposits: float | None = None) -> dict:
+        """Profit and loss, before and after the LLM bill.
+
+        With `net_deposits` (live accounts) profit is equity minus everything paid in,
+        so topping up the account is not mistaken for a gain.
+        """
+        base = net_deposits if net_deposits else (self.state.get("baseline_equity") or equity)
         gross = equity - base
         ai = AICostLedger(self.s).total()
         net = gross - ai
@@ -229,6 +233,10 @@ class Executor:
         acct = self.broker.account()
         self.risk.update(acct.equity)
         return acct
+
+    def pnl_report(self, equity: float) -> dict:
+        deposits = getattr(self.broker, "net_deposits", lambda: None)()
+        return self.risk.pnl(equity, deposits)
 
     def set_target(
         self,

@@ -186,7 +186,7 @@ class TradingAgent:
         for p in out["positions"]:
             p["protection"] = self.executor.broker.get_protection(p["coin"])
         out["risk"] = self.executor.risk.status(acct.equity)
-        out["pnl"] = self.executor.risk.pnl(acct.equity)
+        out["pnl"] = self.executor.pnl_report(acct.equity)
         out["mode"] = self.s.mode + (" (dry run: trades are simulated only)" if self.executor.dry_run else "")
         return out
 

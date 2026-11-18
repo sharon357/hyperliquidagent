@@ -299,7 +299,7 @@ def status():
     console.print(_metrics_table(d, "Account"))
     if positions:
         console.print(_table(pd.DataFrame(positions), "Positions"))
-    pnl = executor.risk.pnl(acct.equity)
+    pnl = executor.pnl_report(acct.equity)
     pnl.pop("note")
     console.print(_metrics_table(pnl, "Profit and loss (net = trading PnL minus AI cost)"))
     risk = executor.risk.status(acct.equity)
@@ -556,7 +556,7 @@ def auto(
         results = pilot.tick()
         acct = executor.account()
         moved = [r for r in results if r["status"] not in ("hold", "noop")]
-        pnl = executor.risk.pnl(acct.equity)
+        pnl = executor.pnl_report(acct.equity)
         console.log(
             f"equity ${acct.equity:,.2f}, net PnL after AI cost ${pnl['net_pnl_usd']:+,.2f} (AI ${pnl['ai_cost_usd']:.2f}), {len(acct.positions)} position(s), "
             + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
@@ -705,9 +705,9 @@ def api(
 def serve(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: Optional[int] = typer.Option(None, "--port", help="Defaults to $PORT, then 8787"),
-    tick: str = typer.Option("5m", "--tick"),
-    review_every: str = typer.Option("4h", "--review-every"),
-    research_every: str = typer.Option("24h", "--research-every"),
+    tick: str = typer.Option("5m", "--tick", envvar="HL_TICK"),
+    review_every: str = typer.Option("4h", "--review-every", envvar="HL_REVIEW_EVERY"),
+    research_every: str = typer.Option("24h", "--research-every", envvar="HL_RESEARCH_EVERY"),
     no_llm: bool = typer.Option(False, "--no-llm"),
     live: bool = O_LIVE,
 ):
@@ -744,7 +744,7 @@ def serve(
                 with lock:
                     results = pilot.tick()
                     acct = executor.account()
-                    pnl = executor.risk.pnl(acct.equity)
+                    pnl = executor.pnl_report(acct.equity)
                 moved = [r for r in results if r["status"] not in ("hold", "noop")]
                 console.log(
                     f"equity ${acct.equity:,.2f}, net PnL after AI cost ${pnl['net_pnl_usd']:+,.2f}, {len(acct.positions)} position(s), "
