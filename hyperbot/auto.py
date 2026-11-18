@@ -124,6 +124,7 @@ def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> d
             log(f"research: {coin} {interval} done ({len(df)} bars)")
     finalize_rows(rows)
     card = {
+        "coins": list(settings.coins),
         "candidates_tested": len(rows),
         "generated": utc_now().isoformat(timespec="seconds"),
         "days": settings.research_days,
@@ -324,6 +325,7 @@ MANAGER_PROMPT = """You manage an automated trading account on Hyperliquid perpe
 How the pieces work:
 - `get_research` returns a scorecard for every strategy on every coin and timeframe over recent months, costs included. The `oos_*` numbers come from walk-forward testing, where parameters were chosen only on earlier data and then run on unseen data; they are the honest estimate. The `fitted_*` numbers use the best parameters picked with hindsight and are always flattering. Judge by out-of-sample results, and treat a large gap between fitted and out-of-sample as a sign of overfitting.
 - Three columns measure luck. `psr` is the probability that a strategy's true Sharpe ratio is above zero given how short and lumpy its record is. `dsr` is the same probability after allowing for the fact that it is one of `candidates_tested` rows you are choosing among; the best of many worthless strategies always looks good, and `dsr` is what remains after discounting that. `half_kelly` is half the leverage that would maximise long-run growth if the out-of-sample record were the truth, so treat it as a ceiling on that strategy's weight, never a target.
+- Orders below the exchange minimum (`min_order_usd` in the account's risk limits) are skipped, so on a small account a position only exists if weight x risk_scale x equity for that coin clears it. Work out the dollar size before you choose: fewer, larger allocations on one or two coins are the only way a small account can trade at all, and you may use leverage up to `max_leverage` when the evidence and the stop distance justify it.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
 - Each cycle starts fresh. Your memory is the journal (`get_recent_decisions`) and the current playbook (`get_playbook`), so put your reasoning and what would change your mind in the rationale and in your final report.
 
@@ -443,6 +445,7 @@ class AutoPilot:
         self.on_event = on_event
         self.runner = PortfolioRunner(settings, executor)
         self.last_review = 0.0
+        self.last_review_equity = 0.0
         self._agent: PortfolioAgent | None = None
 
     def _rules(self, card: dict, why: str) -> None:
@@ -474,10 +477,19 @@ class AutoPilot:
     def tick(self) -> list[dict]:
         card = load_scorecard(self.s)
         fresh = False
-        if card is None or _age_seconds(card["generated"]) > self.research_seconds:
+        stale = card is not None and (
+            _age_seconds(card["generated"]) > self.research_seconds or card.get("coins", self.s.coins) != list(self.s.coins)
+        )
+        if card is None or stale:
             self.log("running research (backtests and walk-forward on every strategy); this takes a few minutes")
             card = build_scorecard(self.s, self.log)
             fresh = True
-        if fresh or load_playbook(self.s) is None or time.time() - self.last_review > self.review_seconds:
+        equity = self.executor.account().equity
+        # A deposit or withdrawal changes what sizes are possible, so decide again.
+        resized = self.last_review_equity > 0 and abs(equity / self.last_review_equity - 1) > 0.25
+        if resized:
+            self.log(f"account size changed from ${self.last_review_equity:,.2f} to ${equity:,.2f}: reviewing the playbook")
+        if fresh or resized or load_playbook(self.s) is None or time.time() - self.last_review > self.review_seconds:
+            self.last_review_equity = equity
             self.manage(card, fresh)
         return self.runner.step(load_playbook(self.s))

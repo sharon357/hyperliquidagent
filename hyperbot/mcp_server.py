@@ -23,8 +23,32 @@ INSTRUCTIONS = (
 )
 
 
+class RemoteService:
+    """Forwards every operation to a running `hyperbot serve` / `hyperbot api` (e.g. the cloud bot)."""
+
+    def __init__(self, url: str, token: str):
+        self.url = url.rstrip("/")
+        self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+
+    def call(self, name: str, args: dict | None = None) -> dict:
+        import requests
+
+        try:
+            r = requests.post(f"{self.url}/v1/{name}", json=args or {}, headers=self.headers, timeout=300)
+            return r.json() if r.headers.get("content-type", "").startswith("application/json") else {"error": f"HTTP {r.status_code}"}
+        except Exception as e:
+            return {"error": f"could not reach {self.url}: {type(e).__name__}: {e}"}
+
+
 def build_server() -> MCPServer:
-    svc = Service()
+    import os
+
+    from dotenv import load_dotenv
+
+    load_dotenv(".env")
+    remote = os.getenv("HL_REMOTE_URL", "").strip()
+    # With HL_REMOTE_URL set, Claude talks to the bot that is actually trading instead of a local copy.
+    svc = RemoteService(remote, os.getenv("HL_API_TOKEN", "").strip()) if remote else Service()
     mcp = MCPServer("hyperbot", instructions=INSTRUCTIONS)
 
     @mcp.tool()

@@ -181,6 +181,7 @@ class RiskManager:
             "max_trades_per_day": s.max_trades_per_day,
             "min_order_usd": s.min_order_usd,
             "max_stop_loss_pct": s.max_stop_loss_pct,
+            "autopilot_exposure_multiplier": s.exposure_multiplier,
         }
 
     def check(self, coin: str, target_usd: float, account: AccountState) -> RiskDecision:
