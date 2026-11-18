@@ -169,6 +169,14 @@ def _default_stop(settings: Settings, atr_pct: float | None) -> float:
     return round(float(np.clip(stop, 1.0, settings.max_stop_loss_pct)), 2)
 
 
+def _trail_setting(value) -> float:
+    try:
+        v = float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return -1.0 if v < 0 else round(min(v, 50.0), 2)
+
+
 def make_playbook(
     settings: Settings,
     scorecard: dict | None,
@@ -231,6 +239,9 @@ def make_playbook(
                 "weight": min(weight, settings.max_position_pct / 100),
                 "stop_loss_pct": 0.0 if wants_no_stop else round(float(np.clip(float(stop), 0.5, settings.max_stop_loss_pct)), 2),
                 "take_profit_pct": round(float(np.clip(float(a.get("take_profit_pct") or 0), 0.0, 50.0)), 2),
+                # 0 = default (same distance as the stop), -1 = off, otherwise a percentage
+                "trail_pct": _trail_setting(a.get("trail_pct")),
+                "breakeven_at_pct": _trail_setting(a.get("breakeven_at_pct")),
                 "oos_sharpe": row["oos_sharpe"] if row else None,
             }
         )
@@ -314,8 +325,78 @@ class PortfolioRunner:
             t["fraction"] += sig * a["weight"] * playbook.get("risk_scale", 1.0) * self.s.exposure_multiplier
             stops = [x for x in (t["stop_loss_pct"], a["stop_loss_pct"]) if x]
             t["stop_loss_pct"] = min(stops) if stops else 0.0
+            for key in ("trail_pct", "breakeven_at_pct"):
+                new, old = a.get(key, 0.0) or 0.0, t.get(key)
+                # tightest explicit setting wins; "off" only if every allocation on the coin says off
+                if old is None:
+                    t[key] = new
+                elif new > 0 and old > 0:
+                    t[key] = min(new, old)
+                elif new >= 0 and old < 0 or (new > 0 and old == 0):
+                    t[key] = new
             t["parts"].append(f"{a['strategy']}@{a['interval']}={sig:+.2f}")
         return out
+
+    def _trail(self, coin: str, t: dict, pos) -> str | None:
+        """Ratchet a position's stop in its favour. The stop never moves back.
+
+        - trailing: the stop follows the best price seen at `trail_pct` behind it;
+        - break-even: once the trade has been `breakeven_at_pct` in profit, the stop
+          is at least the entry price, so a winner cannot become a loser.
+        The level is remembered per position, so rewriting the playbook or resizing
+        the position cannot reset it.
+        """
+        trails = self.state.setdefault("trail", {})
+        if pos is None:
+            trails.pop(coin, None)
+            return None
+        side = 1 if pos.size > 0 else -1
+        st = trails.get(coin)
+        if not st or st["side"] != side:
+            st = {"side": side, "best": pos.mark_px, "stop": None}
+        st["entry"] = pos.entry_px
+        st["best"] = max(st["best"], pos.mark_px) if side > 0 else min(st["best"], pos.mark_px)
+        trails[coin] = st
+
+        current = self.executor.broker.get_protection(coin)
+        live = current.get("stop_px")
+        if st["stop"] is None and live:
+            st["stop"] = live  # adopt the stop the position was opened with
+
+        base = t.get("stop_loss_pct") or 0.0
+        trail = t.get("trail_pct", 0.0) or 0.0
+        breakeven = t.get("breakeven_at_pct", 0.0) or 0.0
+        trail = base if trail == 0 else trail  # 0 = same distance as the stop; negative = off
+        breakeven = base if breakeven == 0 else breakeven
+        candidates = [st["stop"]] if st["stop"] else []
+        if base > 0:
+            candidates.append(pos.entry_px * (1 - side * base / 100))  # a tighter stop in a new plan takes effect
+        if trail > 0:
+            candidates.append(st["best"] * (1 - side * trail / 100))
+        best_profit = side * (st["best"] / pos.entry_px - 1) * 100
+        if breakeven > 0 and best_profit >= breakeven:
+            candidates.append(pos.entry_px * (1 + side * 0.001))  # entry plus a little for fees
+        if not candidates:
+            return None
+        desired = max(candidates) if side > 0 else min(candidates)
+        st["stop"] = desired
+
+        if (side > 0 and pos.mark_px <= desired) or (side < 0 and pos.mark_px >= desired):
+            # Price is already through the ratcheted level: take the exit now.
+            self.executor.set_target(coin, 0.0, source="autopilot", reason=f"trailing stop at {desired:.6g}")
+            trails.pop(coin, None)
+            return "closed"
+        # This level is the source of truth. Resizing a position re-places its exchange stop
+        # relative to the current price, which could loosen it: put it back. Small improvements
+        # (under 0.25%) are batched so the order is not re-sent every tick.
+        if live is None or abs(desired / live - 1) > 0.0025:
+            errors = self.executor.broker.set_protection(coin, desired, current.get("tp_px"))
+            self.executor.journal.write(
+                "trail", coin=coin, stop_px=round(desired, 6), was=live, best=st["best"], entry=pos.entry_px,
+                locked_in_pct=round(side * (desired / pos.entry_px - 1) * 100, 2), errors=errors,
+            )
+            return "moved"
+        return None
 
     def step(self, playbook: dict | None) -> list[dict]:
         playbook = playbook or {"allocations": []}
@@ -350,6 +431,9 @@ class PortfolioRunner:
                 refresh_protection=False,
             )
             now = self.executor.broker.account().positions.get(coin) if not self.executor.dry_run else None
+            if not self.executor.dry_run and self._trail(coin, t, now) == "closed":
+                blocked[coin] = int(np.sign(now.size))  # exited on the trailing stop: stay out like any stop-out
+                now = None
             applied[coin] = int(np.sign(now.size)) if now else 0
             if applied[coin] == 0 and not blocked.get(coin):
                 applied.pop(coin)
@@ -397,6 +481,7 @@ How the pieces work:
 - Three columns measure luck. `psr` is the probability that a strategy's true Sharpe ratio is above zero given how short and lumpy its record is. `dsr` is the same probability after allowing for the fact that it is one of `candidates_tested` rows you are choosing among; the best of many worthless strategies always looks good, and `dsr` is what remains after discounting that. `half_kelly` is half the leverage that would maximise long-run growth if the out-of-sample record were the truth, so treat it as a ceiling on that strategy's weight, never a target.
 - Orders below the exchange minimum (`min_order_usd` in the account's risk limits) are skipped, so on a small account a position only exists if weight x risk_scale x equity for that coin clears it. Work out the dollar size before you choose: fewer, larger allocations on one or two coins are the only way a small account can trade at all, and you may use leverage up to `max_leverage` when the evidence and the stop distance justify it.
 - Each allocation can carry a `take_profit_pct`: the position is closed when price has moved that far in its favour. Use it when you expect a move of a particular size (a bounce to a level, a mean-reversion target); leave it at 0 for trend allocations, which make their money by letting winners run.
+- Stops ratchet. Each allocation has a `trail_pct` (the stop follows the best price at that distance) and a `breakeven_at_pct` (once the trade has been that far in profit, the stop is at least the entry price). The stop only ever moves in the position's favour, and its level is remembered per position: rewriting the playbook, resizing, or setting a wider stop does not move it back. `get_playbook` shows each position's current trailing level under `trailing_stops`. Choose the distances to suit the trade: a trend you want to ride needs a trail wide enough to survive normal pullbacks (around the stop distance or 2 to 3 times ATR), while a quick catalyst or mean-reversion trade can trail tightly and go to break-even early. Turning trailing off (-1) is for hedged legs and positions you are deliberately holding through noise.
 - `close_position` closes a coin now and keeps it closed until the strategies flip side or you write a new playbook. Use it to bank a profit or cut a position when your read has changed faster than the strategies will react. Writing a playbook clears every such hold (and any hold left by a stop-out), so that is also how you re-enter.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
 - Each cycle starts fresh. Your memory is the journal (`get_recent_decisions`) and the current playbook (`get_playbook`), so put your reasoning and what would change your mind in the rationale and in your final report.
@@ -448,8 +533,10 @@ MANAGER_TOOLS = [
                             "weight": {"type": "number", "description": "Fraction of equity this strategy controls at full signal, e.g. 0.25"},
                             "stop_loss_pct": {"type": "number", "description": "Stop distance in percent; 0 to use three times ATR; -1 for no stop at all (only if stop_loss_required is false in the risk limits)"},
                             "take_profit_pct": {"type": "number", "description": "Close the position after this favourable move in percent; 0 for none"},
+                            "trail_pct": {"type": "number", "description": "Trailing stop: distance in percent the stop follows behind the best price. 0 = same as the stop distance, -1 = no trailing"},
+                            "breakeven_at_pct": {"type": "number", "description": "Once the trade has been this many percent in profit, the stop moves to at least the entry price. 0 = same as the stop distance, -1 = never"},
                         },
-                        "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct", "take_profit_pct"],
+                        "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct", "take_profit_pct", "trail_pct", "breakeven_at_pct"],
                         "additionalProperties": False,
                     },
                 },
@@ -626,7 +713,12 @@ class PortfolioAgent(TradingAgent):
             live = {c: {"net_target_fraction": round(t["fraction"], 3), "signals": t["parts"]} for c, t in self.runner.targets(pb).items()}
         except Exception as e:
             live = {"error": str(e)}
-        return {"playbook": pb, "live_targets": live, "blocked_after_stop": self.runner.state["blocked"]}
+        return {
+            "playbook": pb,
+            "live_targets": live,
+            "blocked_after_stop": self.runner.state["blocked"],
+            "trailing_stops": self.runner.state.get("trail", {}),
+        }
 
     def tool_close_position(self, a: dict) -> dict:
         coin = str(a["coin"]).upper()

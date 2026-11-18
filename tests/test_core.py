@@ -781,3 +781,67 @@ def test_ai_can_set_its_own_limits_within_outer_bounds(stack, monkeypatch):
     s.require_stop = True
     pb, warnings = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": -1, "take_profit_pct": 0}])
     assert pb["allocations"][0]["stop_loss_pct"] > 0 and warnings
+
+
+def test_trailing_stop_ratchets_and_survives_playbook_rewrites(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    alloc = {"coin": "BTC", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": 0, "breakeven_at_pct": 3}
+    pb, _ = auto.make_playbook(s, None, [alloc])
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(96.0)  # entry 100, 4% stop
+
+    data.prices["BTC"] = 102.0  # winning a little: the stop follows 4% behind the best price
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(97.92)
+
+    data.prices["BTC"] = 103.5  # past the break-even trigger: worst case is now a scratch
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(100.1)
+
+    data.prices["BTC"] = 110.0  # keeps ratcheting: 4% behind 110
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(105.6)
+
+    data.prices["BTC"] = 108.0  # a pullback never moves the stop back
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(105.6)
+
+    # The manager rewrites the plan with a wider stop and a bigger size: the ratchet holds.
+    wider = {**alloc, "weight": 0.9, "stop_loss_pct": 8, "trail_pct": 8}
+    pb2, _ = auto.make_playbook(s, None, [wider])
+    assert runner.step(pb2)[0]["status"] == "executed"
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(105.6)
+
+    data.prices["BTC"] = 105.0  # reversal: out with the profit, and not straight back in
+    runner.step(pb2)
+    assert "BTC" not in broker.account().positions
+    assert broker.account().equity == pytest.approx(10_140, abs=1)  # +250 on the first 50 units, -110 on the add at 108
+    assert runner.step(pb2)[0]["status"] == "noop"
+
+
+def test_trailing_can_be_switched_off_and_works_for_shorts(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    off, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}])
+    runner.step(off)
+    data.prices["BTC"] = 90.0
+    runner.step(off)
+    # No trailing: the stop stays a fixed 5% from the entry. (Adding at 90 lowered the average entry
+    # to 98.57, so the level is 103.5; without the fix a resize would have dragged it to 94.5.)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(103.5, abs=0.01)
+
+    on, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0, "trail_pct": 3, "breakeven_at_pct": 2}])
+    runner.step(on)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(92.7)  # 3% above the best (lowest) price for a short
+    data.prices["BTC"] = 80.0
+    runner.step(on)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(82.4)
