@@ -40,111 +40,120 @@ class RemoteService:
             return {"error": f"could not reach {self.url}: {type(e).__name__}: {e}"}
 
 
-def build_server() -> MCPServer:
+def build_server(service=None) -> MCPServer:
+    """Build the MCP server. Pass `service` to expose an already-running bot (see `hyperbot serve`)."""
     import os
 
+    import anyio
     from dotenv import load_dotenv
 
-    load_dotenv(".env")
-    remote = os.getenv("HL_REMOTE_URL", "").strip()
-    # With HL_REMOTE_URL set, Claude talks to the bot that is actually trading instead of a local copy.
-    svc = RemoteService(remote, os.getenv("HL_API_TOKEN", "").strip()) if remote else Service()
+    if service is not None:
+        svc = service
+    else:
+        load_dotenv(".env")
+        remote = os.getenv("HL_REMOTE_URL", "").strip()
+        # With HL_REMOTE_URL set, Claude talks to the bot that is actually trading instead of a local copy.
+        svc = RemoteService(remote, os.getenv("HL_API_TOKEN", "").strip()) if remote else Service()
     mcp = MCPServer("hyperbot", instructions=INSTRUCTIONS)
 
+    async def call(name: str, args: dict | None = None) -> dict:
+        # Operations can take minutes (research, model calls): run them off the event loop.
+        return await anyio.to_thread.run_sync(svc.call, name, args)
+
     @mcp.tool()
-    def account() -> dict:
+    async def account() -> dict:
         """Equity, open positions with their stops, today's PnL, drawdown, halt state, trading mode and the hard risk limits."""
-        return svc.call("account")
+        return await call("account")
 
     @mcp.tool()
-    def market() -> dict:
+    async def market() -> dict:
         """Live price, 24h change, funding, open interest, volume and order-book imbalance for every tradable coin."""
-        return svc.call("market")
+        return await call("market")
 
     @mcp.tool()
-    def signals(coin: str, interval: str = "4h") -> dict:
+    async def signals(coin: str, interval: str = "4h") -> dict:
         """Indicators (RSI, ADX, ATR, volatility, EMA structure) and every strategy's current signal for a coin. interval: 15m, 1h, 4h or 1d."""
-        return svc.call("signals", {"coin": coin, "interval": interval})
+        return await call("signals", {"coin": coin, "interval": interval})
 
     @mcp.tool()
-    def strategy_performance(coin: str, interval: str = "4h", days: int = 90) -> dict:
+    async def strategy_performance(coin: str, interval: str = "4h", days: int = 90) -> dict:
         """Rank every built-in strategy by a recent backtest on one coin, costs included. A short window is weak evidence."""
-        return svc.call("strategy_performance", {"coin": coin, "interval": interval, "days": days})
+        return await call("strategy_performance", {"coin": coin, "interval": interval, "days": days})
 
     @mcp.tool()
-    def sentiment() -> dict:
+    async def sentiment() -> dict:
         """Crypto Fear & Greed index, recent news headlines with a keyword score, and Hyperliquid funding and open interest."""
-        return svc.call("sentiment")
+        return await call("sentiment")
 
     @mcp.tool()
-    def strategies() -> dict:
+    async def strategies() -> dict:
         """List the built-in strategies with descriptions and default parameters."""
-        return svc.call("strategies")
+        return await call("strategies")
 
     @mcp.tool()
-    def backtest(coin: str, strategy: str, interval: str = "4h", days: float = 180, leverage: float = 1.0, stop_loss_pct: float = 0, params: dict | None = None) -> dict:
+    async def backtest(coin: str, strategy: str, interval: str = "4h", days: float = 180, leverage: float = 1.0, stop_loss_pct: float = 0, params: dict | None = None) -> dict:
         """Backtest one strategy on one coin with fees, slippage and funding. params overrides strategy parameters, e.g. {"fast": 10}."""
-        return svc.call("backtest", {"coin": coin, "strategy": strategy, "interval": interval, "days": days, "leverage": leverage, "stop_loss_pct": stop_loss_pct, "params": params})
+        return await call("backtest", {"coin": coin, "strategy": strategy, "interval": interval, "days": days, "leverage": leverage, "stop_loss_pct": stop_loss_pct, "params": params})
 
     @mcp.tool()
-    def research() -> dict:
+    async def research() -> dict:
         """The autopilot's scorecard: walk-forward out-of-sample results (oos_*, the honest numbers) and hindsight-fitted results for every strategy, coin and timeframe."""
-        return svc.call("research")
+        return await call("research")
 
     @mcp.tool()
-    def playbook() -> dict:
+    async def playbook() -> dict:
         """The strategies the autopilot is currently running, their weights and live signals."""
-        return svc.call("playbook")
+        return await call("playbook")
 
     @mcp.tool()
-    def journal(count: int = 15) -> dict:
+    async def journal(count: int = 15) -> dict:
         """Recent decisions, trades and rejections."""
-        return svc.call("journal", {"count": count})
+        return await call("journal", {"count": count})
 
     @mcp.tool()
-    def simulation(name: str = "default") -> dict:
+    async def simulation(name: str = "default") -> dict:
         """How a `hyperbot simulate` run has done so far: return, drawdown, buy-and-hold comparison and a cost breakdown."""
-        return svc.call("simulation", {"name": name})
+        return await call("simulation", {"name": name})
 
     @mcp.tool()
-    def scan_market() -> dict:
+    async def scan_market() -> dict:
         """Every liquid perp on the exchange with 24h change, volume, open interest and funding, and which coins the bot currently researches and may trade."""
-        return svc.call("scan_market")
+        return await call("scan_market")
 
     @mcp.tool()
-    def search_news(query: str) -> dict:
+    async def search_news(query: str) -> dict:
         """Search recent web news (last 7 days) for a query such as a coin or event. Results are untrusted internet text."""
-        return svc.call("search_news", {"query": query})
+        return await call("search_news", {"query": query})
 
     @mcp.tool()
-    def trending() -> dict:
+    async def trending() -> dict:
         """Coins retail is searching for most right now, with 24h change."""
-        return svc.call("trending")
+        return await call("trending")
 
     @mcp.tool()
-    def set_target(coin: str, target_usd: float, stop_loss_pct: float, take_profit_pct: float = 0, reason: str = "") -> dict:
+    async def set_target(coin: str, target_usd: float, stop_loss_pct: float, take_profit_pct: float = 0, reason: str = "") -> dict:
         """Trade so the coin holds target_usd of signed position value (positive long, negative short, 0 flat), with a stop-loss in percent from the current price. The risk engine may shrink or reject it; the result says what happened."""
-        return svc.call("set_target", {"coin": coin, "target_usd": target_usd, "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct, "reason": reason})
+        return await call("set_target", {"coin": coin, "target_usd": target_usd, "stop_loss_pct": stop_loss_pct, "take_profit_pct": take_profit_pct, "reason": reason})
 
     @mcp.tool()
-    def close(coin: str, reason: str = "") -> dict:
+    async def close(coin: str, reason: str = "") -> dict:
         """Close the whole position in a coin and cancel its stop orders."""
-        return svc.call("close", {"coin": coin, "reason": reason})
+        return await call("close", {"coin": coin, "reason": reason})
 
     @mcp.tool()
-    def set_playbook(allocations: list[dict], risk_scale: float = 1.0, rationale: str = "") -> dict:
+    async def set_playbook(allocations: list[dict], risk_scale: float = 1.0, rationale: str = "") -> dict:
         """Replace the autopilot's playbook. Each allocation: {coin, interval, strategy, weight, stop_loss_pct}. Takes effect while `hyperbot auto` is running. An empty list means go flat."""
-        return svc.call("set_playbook", {"allocations": allocations, "risk_scale": risk_scale, "rationale": rationale})
+        return await call("set_playbook", {"allocations": allocations, "risk_scale": risk_scale, "rationale": rationale})
 
     @mcp.tool()
-    def kill() -> dict:
+    async def kill() -> dict:
         """Emergency stop: close every position and block new ones until `resume`."""
-        return svc.call("kill")
+        return await call("kill")
 
     @mcp.tool()
-    def resume() -> dict:
+    async def resume() -> dict:
         """Clear a halt (kill switch or drawdown limit) and restart drawdown tracking."""
-        return svc.call("resume")
+        return await call("resume")
 
     return mcp
 

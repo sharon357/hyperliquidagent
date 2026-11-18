@@ -6,6 +6,10 @@ POST /v1/{operation}      any operation, parameters as a JSON body
 
 If HL_API_TOKEN is set, every request needs `Authorization: Bearer <token>`.
 Without a token the server only accepts being bound to localhost.
+
+With a token, the same operations are also served as a remote MCP endpoint at
+/mcp/<token>, for clients that connect by URL (such as the Claude apps). The
+token in the path is the only credential, so treat that URL like a password.
 """
 
 from __future__ import annotations
@@ -19,7 +23,31 @@ from .service import OPERATIONS, Service
 
 def create_app(service: Service | None = None, token: str = "") -> FastAPI:
     svc = service or Service()
-    app = FastAPI(title="hyperbot", version="0.1.0", description=__doc__)
+    mcp_app = None
+    lifespan = None
+    if token:
+        from contextlib import asynccontextmanager
+
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        from .mcp_server import build_server
+
+        mcp_server = build_server(svc)
+        mcp_app = mcp_server.streamable_http_app(
+            streamable_http_path=f"/mcp/{token}",
+            stateless_http=True,
+            json_response=True,
+            # Served behind the host's proxy on a public domain, so the localhost-only Host check does not apply.
+            transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+            host="0.0.0.0",
+        )
+
+        @asynccontextmanager
+        async def lifespan(_app):
+            async with mcp_server.session_manager.run():
+                yield
+
+    app = FastAPI(title="hyperbot", version="0.1.0", description=__doc__, lifespan=lifespan)
 
     def auth(request: Request) -> None:
         if not token:
@@ -51,4 +79,6 @@ def create_app(service: Service | None = None, token: str = "") -> FastAPI:
     def write(name: str, body: dict | None = Body(default=None)) -> dict:
         return run(name, body or {})
 
+    if mcp_app is not None:
+        app.mount("/", mcp_app)  # after the routes above, so it only sees paths they did not match
     return app
