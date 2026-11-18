@@ -55,6 +55,7 @@ Example: `curl -X POST localhost:8787/v1/set_target -H 'content-type: applicatio
 - Research: `strategies`, `compare COIN`, `backtest COIN -s STRATEGY`, `optimize`, `walkforward`, `signals COIN`, `sentiment`, `research`
 - Simulation: `simulate --amount 5000` (live paper run with order-book fills and market impact), `simulate --report`, `replay --days 150` (historical replay of the rule-based autopilot)
 - Trading: `auto` (research, pick strategies, trade, repeat), `agent` (LLM sets positions directly), `run COIN -s STRATEGY`, `trade COIN USD`, `close`, `kill`, `resume`, `status`, `playbook`, `journal`
+- Servers: `serve` (autopilot + HTTP API in one process, for cloud hosts), `api`, `mcp`
 - Setup: `setup`, `doctor`, `paper-reset`
 
 Run `hyperbot COMMAND --help` for options.

@@ -185,6 +185,20 @@ docker compose down
 
 State, cached data and reports are kept in `./state`, `./data` and `./reports` on the host. On a cloud VM, copy the folder, install Docker and run the same commands.
 
+## Railway (or any host that builds a Dockerfile)
+
+The image's default command is `hyperbot serve`: the autopilot and the HTTP API in one process, sharing one account, listening on `$PORT`.
+
+```bash
+railway init --name hyperliquidagent
+railway add --service hyperbot --variables "HL_MODE=paper" --variables "HL_API_TOKEN=<long random string>"
+railway volume add --mount-path /app/state      # Git Bash: prefix with MSYS_NO_PATHCONV=1
+railway up --detach
+railway domain
+```
+
+Add `DEEPSEEK_API_KEY` (and, for live trading, `HL_PRIVATE_KEY`, `HL_ACCOUNT_ADDRESS`, `HL_MODE`, `HL_CONFIRM_MAINNET`) with `railway variables --set "NAME=value"`; the service restarts with them. The volume keeps the account, journal and playbook across deploys. `serve` refuses to start on a public address without `HL_API_TOKEN`.
+
 ## Known limits
 
 - Backtests fill at the next bar's open with fixed slippage. They ignore order-book depth, partial fills and latency.

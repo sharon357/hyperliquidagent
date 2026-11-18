@@ -7,6 +7,7 @@ HL_CONFIRM_MAINNET=yes; otherwise they are dry runs.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import replace
 
 from .auto import PortfolioAgent, PortfolioRunner
@@ -43,13 +44,24 @@ class _NoLLM:
 
 
 class Service:
-    def __init__(self, settings: Settings | None = None):
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        executor: Executor | None = None,
+        runner: PortfolioRunner | None = None,
+        lock: threading.Lock | None = None,
+    ):
+        """Pass `executor`, `runner` and `lock` to share one account with a running autopilot (see `hyperbot serve`)."""
         s = settings or load_settings()
         self.s = s
         self.dry_run = s.mode == "mainnet" and not s.confirm_mainnet
-        self.executor = Executor(s, make_broker(s), RiskManager(s), Journal(s.state_dir), dry_run=self.dry_run)
+        self.executor = executor or Executor(s, make_broker(s), RiskManager(s), Journal(s.state_dir), dry_run=self.dry_run)
+        self.dry_run = self.executor.dry_run
         self.data = HLData()
-        self.tools = PortfolioAgent(s, self.executor, self.data, client=_NoLLM(), runner=PortfolioRunner(s, self.executor))
+        self.lock = lock or threading.Lock()
+        self.tools = PortfolioAgent(
+            s, self.executor, self.data, client=_NoLLM(), runner=runner or PortfolioRunner(s, self.executor)
+        )
 
     def describe(self) -> dict:
         return {
@@ -67,7 +79,8 @@ class Service:
         if name not in OPERATIONS:
             return {"error": f"unknown operation {name!r}", "available": sorted(OPERATIONS)}
         try:
-            return getattr(self, f"_op_{name}")(args)
+            with self.lock:
+                return getattr(self, f"_op_{name}")(args)
         except Exception as e:
             return {"error": f"{type(e).__name__}: {e}"}
 

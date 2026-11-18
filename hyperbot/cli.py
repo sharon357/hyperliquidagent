@@ -697,6 +697,65 @@ def api(
 
 
 @app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: Optional[int] = typer.Option(None, "--port", help="Defaults to $PORT, then 8787"),
+    tick: str = typer.Option("5m", "--tick"),
+    review_every: str = typer.Option("4h", "--review-every"),
+    research_every: str = typer.Option("24h", "--research-every"),
+    no_llm: bool = typer.Option(False, "--no-llm"),
+    live: bool = O_LIVE,
+):
+    """Autopilot and HTTP API in one process, sharing one account. Made for cloud hosts."""
+    import os
+    import threading
+    import time
+
+    import uvicorn
+
+    from .api import create_app
+    from .auto import AutoPilot
+    from .runner import parse_duration
+    from .service import Service
+
+    s = load_settings()
+    token = os.getenv("HL_API_TOKEN", "").strip()
+    if host not in ("127.0.0.1", "localhost", "::1") and not token:
+        console.print("[red]Refusing to listen on a public address without HL_API_TOKEN set.[/red]")
+        raise typer.Exit(2)
+    _banner(s, False)
+    _, executor = _stack(s, False, live)
+    use_llm = not no_llm and bool(s.llm_api_key)
+    if not use_llm:
+        console.print("Strategies are picked by the built-in rule (no LLM key, or --no-llm).")
+    lock = threading.Lock()
+    pilot = AutoPilot(s, executor, use_llm, parse_duration(review_every), parse_duration(research_every), console.log)
+    service = Service(s, executor=executor, runner=pilot.runner, lock=lock)
+    wait = parse_duration(tick)
+
+    def loop():
+        while True:
+            try:
+                with lock:
+                    results = pilot.tick()
+                    acct = executor.account()
+                    pnl = executor.risk.pnl(acct.equity)
+                moved = [r for r in results if r["status"] not in ("hold", "noop")]
+                console.log(
+                    f"equity ${acct.equity:,.2f}, net PnL after AI cost ${pnl['net_pnl_usd']:+,.2f}, {len(acct.positions)} position(s), "
+                    + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
+                )
+            except Exception as e:  # keep the API up and try again next tick
+                console.log(f"autopilot tick failed ({type(e).__name__}): {e}")
+            time.sleep(wait)
+
+    threading.Thread(target=loop, daemon=True, name="autopilot").start()
+    port = port or int(os.getenv("PORT", "8787"))
+    console.print(f"API on http://{host}:{port} (token {'required' if token else 'not set: localhost only'}); autopilot ticking every {tick}")
+    uvicorn.run(create_app(service, token=token), host=host, port=port, log_level="warning")
+
+
+@app.command()
 def setup():
     """Interactive first-time setup: asks for your keys and writes .env."""
     from pathlib import Path

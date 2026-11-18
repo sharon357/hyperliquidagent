@@ -11,4 +11,5 @@ RUN pip install .
 RUN mkdir -p /app/state /app/data /app/reports
 
 ENTRYPOINT ["hyperbot"]
-CMD ["auto"]
+# Autopilot plus HTTP API. Needs HL_API_TOKEN; listens on $PORT (default 8787).
+CMD ["serve", "--host", "0.0.0.0"]
