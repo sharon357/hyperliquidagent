@@ -377,7 +377,7 @@ class HyperliquidBroker(Broker):
         universe = self.info.meta()["universe"]
         self._sz_decimals = {a["name"]: int(a["szDecimals"]) for a in universe}
         self._max_leverage = {a["name"]: int(a.get("maxLeverage", 1)) for a in universe}
-        self._leverage_set: set[str] = set()
+        self._leverage_set: set[tuple[str, int]] = set()
         # Unified accounts (and portfolio margin) keep their USDC on the spot side and
         # use it directly as perp collateral, so the perp-only summary reads zero.
         try:
@@ -481,11 +481,11 @@ class HyperliquidBroker(Broker):
         return Fill(True, coin, sign * size, notional / size, error="; ".join(errors))
 
     def set_leverage(self, coin: str, leverage: int) -> None:
-        if coin in self._leverage_set:
-            return
         lev = max(1, min(int(leverage), self._max_leverage.get(coin, 1)))
+        if (coin, lev) in self._leverage_set:
+            return  # already set to this value; re-sent only when the limit changes
         self.exchange.update_leverage(lev, coin, is_cross=True)
-        self._leverage_set.add(coin)
+        self._leverage_set = {x for x in self._leverage_set if x[0] != coin} | {(coin, lev)}
 
     def market(self, coin: str, delta_units: float, reduce_only: bool = False) -> Fill:
         sz = self._round_size(coin, delta_units)
