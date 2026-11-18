@@ -251,8 +251,30 @@ class Ensemble(Strategy):
         return sized.where(votes.abs() >= p["min_agreement"], 0.0).fillna(0.0)
 
 
+DISCRETIONARY = ("hold_long", "hold_short")
+
+
+@register
+class HoldLong(Strategy):
+    name = "hold_long"
+    description = "Always long. No rule behind it: used by the AI manager for its own bets and for hedges."
+
+    def signal(self, df):
+        return pd.Series(1.0, index=df.index)
+
+
+@register
+class HoldShort(Strategy):
+    name = "hold_short"
+    description = "Always short. No rule behind it: used by the AI manager for its own bets and for hedges."
+
+    def signal(self, df):
+        return pd.Series(-1.0, index=df.index)
+
+
 def tradable_strategies() -> list[str]:
-    return [n for n in REGISTRY if n != "buy_hold"]
+    """Rule-based strategies that get researched (not the benchmark or the constant positions)."""
+    return [n for n in REGISTRY if n != "buy_hold" and n not in DISCRETIONARY]
 
 
 # ---------------------------------------------------------------------------

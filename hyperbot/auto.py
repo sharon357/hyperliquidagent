@@ -28,7 +28,7 @@ from .config import Settings
 from .data import HLData, interval_ms, load_history
 from .risk import Executor, utc_now
 from .stats import expected_max_sharpe, psr_from_stats, sharpe_stats
-from .strategies import get_strategy, tradable_strategies
+from .strategies import DISCRETIONARY, get_strategy, tradable_strategies
 
 MAX_ALLOCATIONS = 8
 WF_SPLITS = 3
@@ -51,7 +51,20 @@ def _age_seconds(iso: str) -> float:
 def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable[[str], None] = print) -> list[dict]:
     """Scorecard rows for every strategy on one coin/timeframe history."""
     rows = []
-    atr_pct = float(ind.atr(df).iloc[-1] / df["close"].iloc[-1] * 100)
+    close = df["close"]
+    atr_pct = float(ind.atr(df).iloc[-1] / close.iloc[-1] * 100)
+    per_day = max(int(86_400_000 / interval_ms(interval)), 1)
+
+    def back(days: int):
+        n = days * per_day
+        return round(float(close.iloc[-1] / close.iloc[-1 - n] - 1) * 100, 1) if len(close) > n else None
+
+    coin_stats = {
+        "coin_return_1d_pct": back(1),
+        "coin_return_7d_pct": back(7),
+        "coin_return_30d_pct": back(30),
+        "coin_daily_vol_pct": round(float(close.pct_change().tail(30 * per_day).std() * (per_day**0.5) * 100), 1),
+    }
     for name in tradable_strategies():
         grid = get_strategy(name).grid
         try:
@@ -85,6 +98,7 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
                 "buy_hold_return_pct": float(fitted["buy_hold_return_pct"]),
                 "current_signal": round(signal, 2),
                 "atr_pct": round(atr_pct, 2),
+                **coin_stats,
             }
         )
     return rows
@@ -173,7 +187,7 @@ def make_playbook(
         if interval not in settings.research_intervals:
             warnings.append(f"dropped {label}: interval must be one of {settings.research_intervals}")
             continue
-        if name not in tradable_strategies():
+        if name not in tradable_strategies() and name not in DISCRETIONARY:
             warnings.append(f"dropped {label}: unknown strategy")
             continue
         try:
@@ -184,7 +198,13 @@ def make_playbook(
             warnings.append(f"dropped {label}: weight must be positive")
             continue
         row = index.get((coin, interval, name))
-        if row is None:
+        if name in DISCRETIONARY:
+            # No backtest exists for a discretionary position; borrow the coin's volatility for the default stop.
+            atr_row = next((r for r in (scorecard or {}).get("rows", []) if r["coin"] == coin and r["interval"] == interval), None)
+            row = None
+            if not a.get("stop_loss_pct"):
+                a = {**a, "stop_loss_pct": _default_stop(settings, atr_row["atr_pct"] if atr_row else None)}
+        elif row is None:
             warnings.append(f"{label}: not in the research scorecard, using default parameters")
         elif row["oos_sharpe"] <= 0:
             warnings.append(f"{label}: out-of-sample Sharpe is {row['oos_sharpe']} (it lost money on unseen data)")
@@ -330,6 +350,17 @@ MANAGER_PROMPT = """You manage an automated trading account on Hyperliquid perpe
 
 The owner's goal: maximise the long-run growth of this account, aggressively. They have said plainly that they accept losing the money and would rather lose it on intelligent, well-reasoned bets than leave it idle. So the standard is not caution, it is quality of risk: every position should be one a sharp professional could defend, sized to matter. Sitting flat while there is a candidate with real support is a failure of the job; so is a large bet on thin evidence, because blowing up ends the compounding. Concentrate when you have an edge, press winners, cut what is not working, and take the bigger swing when several independent lines of evidence agree. You decide everything: which markets, when to open, add, reduce, take profit, close and re-enter. They do not want to be asked.
 
+What the owner is hoping for is days of roughly 0.5% to 10% on the account. Treat that as a statement of appetite, not a quota. Returns of that size only come from positions that are large relative to the account, in markets that actually move, held while the move is happening; a 1x position in a coin that moves 2% a day cannot produce them. So look for where the movement and the edge are, and size to it. Equally, a day with no good setup is a day to hold what is working or wait: forcing trades to hit a number is how accounts are lost, and no one compounds at these rates without long stretches of drawdown. Your job is the best risk-adjusted aggression available today, not a fixed daily figure.
+
+There is no preferred market. BTC, ETH and SOL are in the scorecard because they are the most liquid, not because they are the right answer, and for a small account chasing growth they often are not: their daily ranges are small. Compare candidates on what they can earn for this account: expected move (`coin_daily_vol_pct`, `atr_pct`, recent returns), strength of evidence (`psr`, `dsr`, folds), and whether the minimum order lets you hold a meaningful position. Pick a major only when it wins on those terms.
+
+Ways to take risk intelligently, all available to you:
+- Rule-based allocations from the scorecard: the default, because they have out-of-sample evidence behind them.
+- Relative strength across coins: `coin_return_7d_pct` and `coin_return_30d_pct` let you rank the universe. Strong coins tend to keep outperforming weak ones over days to weeks, and the gap is tradable from both sides.
+- Hedged structures: hold a long in one coin and a short in another so that a market-wide move largely cancels and you are paid for the difference between them. A long in the strongest coin against a short in the weakest, or a position in a small perp with an offsetting position in BTC, lets you run more size in your best idea for the same account risk. Use a hedge to keep a position you believe in through a market wobble instead of closing it.
+- Your own discretionary positions: the strategies `hold_long` and `hold_short` simply hold a coin long or short until you change the playbook, with the stop and take-profit you give them. Use them for a hedge leg, or for a high-conviction trade the rules cannot see: a catalyst you have verified with `search_news`, a funding squeeze setup, a breakout on heavy volume. They have no backtest, so they need a specific, written reason, a defined invalidation level as the stop, and usually a take-profit; do not let them become most of the book.
+- Carry: when funding is extreme, being on the paid side is an edge in itself, and it stacks with a trend in the same direction.
+
 The whole exchange is your universe, not just the majors. `scan_market` lists every liquid perp with its 24h move, volume, open interest and funding. The scorecard covers the core coins plus a shortlist of the busiest and fastest movers; `research_coin` runs the same walk-forward research on any other liquid perp and makes it tradable. Smaller perps are where the larger moves are, and also where the traps are:
 - They are more volatile, so the same dollar position carries more risk. Size by volatility (ATR, `oos_volatility_pct`) and give stops room; a stop inside the noise just pays the spread repeatedly.
 - Their history is short and their backtests are the least reliable in the scorecard. A strong recent trend plus heavy volume and rising open interest is better evidence than a fitted Sharpe ratio on three months of data.
@@ -352,6 +383,7 @@ What good management looks like:
 - Prefer strategies with a positive out-of-sample Sharpe, profit in most folds, a high `psr`, and enough trades to mean something. A handful of months is a small sample: one spectacular row is more likely luck than edge, while the same kind of strategy working across several coins and timeframes is better evidence. With this little history `dsr` will usually be low for everything; read that as a reason to keep total size small, and prefer the rows where it is highest.
 - Think in risk, not dollars. Give each allocation a similar share of risk by weighting it inversely to its volatility (`oos_volatility_pct`), so one wild strategy does not dominate. Strategies that make money in different ways (trend, carry, mean reversion) diversify each other far more than the same rule on three correlated coins: BTC, ETH and SOL mostly move together, so three trend-following longs are closer to one bet than three.
 - Scale size with conviction. Around 1x total exposure suits ordinary, reasonably supported setups. Go above it, toward `max_leverage`, only when the best candidates have strong out-of-sample statistics, several timeframes and evidence types agree, and the stop keeps the loss on a wrong call to a few percent of equity. Drop well below 1x when the evidence is thin or sentiment is at a contrarian extreme against you. Never weight an allocation above its `half_kelly`: estimated edges are overstated, and over-betting a real edge still ends in ruin. The drawdowns in the scorecard tell you what a weight will feel like.
+- Stops, targets and re-entries are yours to set. Put the stop where the idea is wrong, not at a round percentage, and the take-profit where you expect the move to stall. When a target is hit or you bank a gain, decide afresh whether to go again and at what size: equity has changed, so size the next trade from the new balance and the evidence as it stands now, pressing harder after a win only if the setup is still as good.
 - Manage open positions actively. Each cycle, look at unrealised PnL and what has changed. Bank part or all of a profit that has reached your target or run into a level where the move is stretched; cut a loser whose thesis has broken without waiting for the stop; add only to positions that are working and still supported.
 - A strategy's recent profit is partly the market regime it happened to meet. Trend rules earn in sustained moves and bleed in ranges; mean reversion is the reverse and can lose heavily in a crash. Ask what regime the record came from and whether the quant signals suggest it is still in force.
 - Costs compound. A strategy with many trades needs a clearly larger edge than one that trades rarely, and fast timeframes pay more in fees and funding for the same idea.
@@ -390,7 +422,7 @@ MANAGER_TOOLS = [
                         "properties": {
                             "coin": {"type": "string"},
                             "interval": {"type": "string", "description": "Timeframe as it appears in the scorecard"},
-                            "strategy": {"type": "string"},
+                            "strategy": {"type": "string", "description": "A strategy from the scorecard, or hold_long / hold_short for a discretionary position or hedge leg"},
                             "weight": {"type": "number", "description": "Fraction of equity this strategy controls at full signal, e.g. 0.25"},
                             "stop_loss_pct": {"type": "number", "description": "Stop distance in percent; 0 to use three times ATR"},
                             "take_profit_pct": {"type": "number", "description": "Close the position after this favourable move in percent; 0 for none"},

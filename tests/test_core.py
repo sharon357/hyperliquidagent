@@ -152,7 +152,7 @@ def test_grid_search_and_walk_forward_run():
 def test_quant_snapshot_is_json_serialisable():
     snap = quant_snapshot(make_df(n=700))
     json.dumps(snap)
-    assert set(snap["strategy_signals"]) == set(REGISTRY) - {"buy_hold"}
+    assert set(snap["strategy_signals"]) == set(REGISTRY) - {"buy_hold", "hold_long", "hold_short"}
 
 
 # ------------------------------------------------------------------ risk + execution
@@ -695,3 +695,37 @@ def test_manager_can_scan_and_research_a_new_coin(stack, monkeypatch):
     s2 = Settings(state_dir=s.state_dir, coins=["BTC", "ETH"], core_coins=["BTC", "ETH"], universe_mode="auto")
     auto.universe.restore(s2)
     assert "HYPE" in s2.coins  # survives a restart
+
+
+def test_discretionary_and_hedged_playbook(stack, monkeypatch):
+    from hyperbot import auto
+    from hyperbot.strategies import REGISTRY, tradable_strategies
+
+    assert "hold_long" in REGISTRY and "hold_long" not in tradable_strategies()  # usable, but never researched
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    card = _card([{"coin": "ETH", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.0, "atr_pct": 2.0}])
+    pb, warnings = auto.make_playbook(
+        s,
+        card,
+        [
+            {"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.6, "stop_loss_pct": 0, "take_profit_pct": 9},
+            {"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.4, "stop_loss_pct": 4, "take_profit_pct": 0},
+        ],
+        source="llm",
+    )
+    assert not warnings
+    assert [(a["strategy"], a["stop_loss_pct"], a["take_profit_pct"]) for a in pb["allocations"]] == [("hold_long", 6.0, 9.0), ("hold_short", 4.0, 0.0)]
+    auto.PortfolioRunner(s, ex).step(pb)
+    pos = broker.account().positions
+    assert pos["ETH"].notional == pytest.approx(6000) and pos["BTC"].notional == pytest.approx(-4000)  # long one, short the other
+    assert broker.get_protection("ETH") == {"stop_px": pytest.approx(9.4), "tp_px": pytest.approx(10.9)}
+
+
+def test_scorecard_rows_carry_coin_momentum(monkeypatch):
+    from hyperbot import auto
+
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["ema_cross"])
+    rows = auto.score_frame(make_df(n=1200), "X", "1h", BacktestConfig(), log=lambda m: None)
+    assert rows and {"coin_return_7d_pct", "coin_return_30d_pct", "coin_daily_vol_pct"} <= set(rows[0])
+    assert rows[0]["coin_daily_vol_pct"] > 0
