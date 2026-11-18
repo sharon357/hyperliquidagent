@@ -287,8 +287,9 @@ def make_playbook(
                 "weight": min(weight, settings.max_position_pct / 100),
                 "stop_loss_pct": 0.0 if wants_no_stop else round(float(np.clip(float(stop), 0.5, settings.max_stop_loss_pct)), 2),
                 "take_profit_pct": round(float(np.clip(float(a.get("take_profit_pct") or 0), 0.0, 50.0)), 2),
-                # 0 (or negative) = off, otherwise a percentage. Off is the default: in backtests a
-                # trail at the stop distance cost the 4h trend strategies most of their return.
+                # 0 = the account default (HL_DEFAULT_TRAIL_MULT x the stop distance), -1 = off, otherwise a percentage.
+                # In backtests a trail at the stop distance cost the 4h trend strategies most of their return,
+                # while one twice as wide roughly matched a plain stop.
                 "trail_pct": _trail_setting(a.get("trail_pct")),
                 "breakeven_at_pct": _trail_setting(a.get("breakeven_at_pct")),
                 "max_hold_hours": max(_trail_setting(a.get("max_hold_hours")), 0.0) * 1.0 if a.get("max_hold_hours") else 0.0,
@@ -435,6 +436,10 @@ class PortfolioRunner:
         base = t.get("stop_loss_pct") or 0.0
         trail = t.get("trail_pct", 0.0) or 0.0
         breakeven = t.get("breakeven_at_pct", 0.0) or 0.0
+        # 0 = use the account default (a multiple of the stop distance); negative = off for this trade.
+        default = base * self.s.default_trail_mult
+        trail = default if trail == 0 else trail
+        breakeven = default if breakeven == 0 else breakeven
         candidates = [st["stop"]] if st["stop"] else []
         if base > 0:
             candidates.append(pos.entry_px * (1 - side * base / 100))  # a tighter stop in a new plan takes effect
@@ -552,7 +557,7 @@ How the pieces work:
 - Each allocation can carry a `take_profit_pct`: the position is closed when price has moved that far in its favour. Use it when you expect a move of a particular size (a bounce to a level, a mean-reversion target); leave it at 0 for trend allocations, which make their money by letting winners run.
 - Every trade has three exits, and you set all of them: the stop (the idea is wrong), the take-profit (the idea has paid), and `max_hold_hours` (the idea has run out of time). A trade taken for a specific catalyst or a short-term bounce should carry a time limit: if the move has not come in the window you expected, the reason for the trade is gone even though neither price level was hit. Leave it at 0 for trend allocations.
 - Correlated legs are one bet. Before finalising weights, `analyze_portfolio` shows how the candidates' out-of-sample returns move together and gives hierarchical-risk-parity weights, which split risk across genuinely different bets instead of across tickers. Use it to decide how much is really riding on one view.
-- Stops ratchet. Each allocation has a `trail_pct` (the stop follows the best price at that distance) and a `breakeven_at_pct` (once the trade has been that far in profit, the stop is at least the entry price). The stop only ever moves in the position's favour, and its level is remembered per position: rewriting the playbook, resizing, or setting a wider stop does not move it back. `get_playbook` shows each position's current trailing level under `trailing_stops`. Both are off unless you set them, and for good reason. In a 150-day backtest of every strategy on eight coins, a trail at the stop distance with a break-even step cut the average return of the 4h trend strategies from about +15% to about +1%, because normal pullbacks shook positions out of trends they would otherwise have ridden; break-even alone cost more than half; a trail twice as wide roughly matched a plain stop. Drawdowns were smaller with trailing, and mean-reversion strategies did slightly better with it. So: leave trend allocations on a plain stop (or a trail at least twice the stop distance) and let the strategy's own signal take them out; use a tight trail and early break-even for trades with a defined, limited move (a catalyst pop, a squeeze, a mean-reversion bounce), or when protecting a gain matters more to you than catching the rest of the move.
+- Stops ratchet. Each allocation has a `trail_pct` (the stop follows the best price at that distance) and a `breakeven_at_pct` (once the trade has been that far in profit, the stop is at least the entry price). The stop only ever moves in the position's favour, and its level is remembered per position: rewriting the playbook, resizing, or setting a wider stop does not move it back. `get_playbook` shows each position's current trailing level under `trailing_stops`. Leaving them at 0 uses the account default shown as `default_trailing` in the risk limits; the owner wants gains protected, so the default is a wide trail. Distance matters. In a 150-day backtest of every strategy on eight coins, a trail at the stop distance with a break-even step cut the average return of the 4h trend strategies from about +15% to about +1%, because normal pullbacks shook positions out of trends they would otherwise have ridden; break-even alone cost more than half; a trail twice as wide roughly matched a plain stop. Drawdowns were smaller with trailing, and mean-reversion strategies did slightly better with it. So: keep trend allocations on a wide trail (about twice the stop distance, which is the default) so a big winner cannot come all the way back, and let the strategy's own signal take them out before that; use a tight trail and early break-even for trades with a defined, limited move (a catalyst pop, a squeeze, a mean-reversion bounce), or when protecting a gain matters more to you than catching the rest of the move.
 - `close_position` closes a coin now and keeps it closed until the strategies flip side or you write a new playbook. Use it to bank a profit or cut a position when your read has changed faster than the strategies will react. Writing a playbook clears every such hold (and any hold left by a stop-out), so that is also how you re-enter.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
 - Each cycle starts fresh. Your memory is the journal (`get_recent_decisions`) and the current playbook (`get_playbook`), so put your reasoning and what would change your mind in the rationale and in your final report.
@@ -604,8 +609,8 @@ MANAGER_TOOLS = [
                             "weight": {"type": "number", "description": "Fraction of equity this strategy controls at full signal, e.g. 0.25"},
                             "stop_loss_pct": {"type": "number", "description": "Stop distance in percent; 0 to use three times ATR; -1 for no stop at all (only if stop_loss_required is false in the risk limits)"},
                             "take_profit_pct": {"type": "number", "description": "Close the position after this favourable move in percent; 0 for none"},
-                            "trail_pct": {"type": "number", "description": "Trailing stop: distance in percent the stop follows behind the best price. 0 = no trailing"},
-                            "breakeven_at_pct": {"type": "number", "description": "Once the trade has been this many percent in profit, the stop moves to at least the entry price. 0 = never"},
+                            "trail_pct": {"type": "number", "description": "Trailing stop: distance in percent the stop follows behind the best price. 0 = the account default (see default_trailing in the risk limits), -1 = no trailing"},
+                            "breakeven_at_pct": {"type": "number", "description": "Once the trade has been this many percent in profit, the stop moves to at least the entry price. 0 = the account default, -1 = never"},
                             "max_hold_hours": {"type": "number", "description": "Time limit: close the position if it is still open after this many hours. 0 = no limit"},
                         },
                         "required": ["coin", "interval", "strategy", "weight", "stop_loss_pct", "take_profit_pct", "trail_pct", "breakeven_at_pct", "max_hold_hours"],

@@ -260,6 +260,11 @@ class RiskManager:
             "min_order_usd": s.min_order_usd,
             "max_stop_loss_pct": s.max_stop_loss_pct,
             "stop_loss_required": s.require_stop,
+            "default_trailing": (
+                f"trail and break-even at {s.default_trail_mult:g}x the stop distance unless a trade sets its own"
+                if s.default_trail_mult > 0
+                else "none unless a trade sets its own"
+            ),
             "limits_set_by": "the AI manager, inside fixed outer bounds" if s.ai_sets_limits else "the owner",
             "autopilot_exposure_multiplier": s.exposure_multiplier,
         }

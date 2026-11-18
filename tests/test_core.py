@@ -961,3 +961,27 @@ def test_time_limit_closes_a_live_position(stack, monkeypatch):
     runner.step(pb)
     assert "BTC" not in broker.account().positions
     assert runner.step(pb)[0]["status"] == "noop"  # and it stays out until the plan changes
+
+
+def test_default_wide_trail_protects_a_big_winner(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.default_trail_mult = 2.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    pb, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 4, "take_profit_pct": 0}])
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(104.0)  # short from 100 with a 4% stop
+    data.prices["BTC"] = 95.0  # +5%: an 8% trail from here (102.6) is the first improvement on the stop
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] < 104.0
+    data.prices["BTC"] = 80.0  # +20%: stop is now far below the entry, so most of the gain is locked
+    runner.step(pb)
+    stop = broker.get_protection("BTC")["stop_px"]
+    assert stop == pytest.approx(86.4) and stop < broker.account().positions["BTC"].entry_px
+    assert "2x the stop distance" in ex.risk.limits()["default_trailing"]
+    # A trade can still opt out.
+    off, _ = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_short", "weight": 0.2, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}])
+    assert off["allocations"][0]["trail_pct"] == -1.0
