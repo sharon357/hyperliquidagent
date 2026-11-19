@@ -881,8 +881,9 @@ class AutoPilot:
         self.runner = PortfolioRunner(settings, executor)
         self.last_review = 0.0
         self.last_review_equity = 0.0
+        self.last_review_profit: float | None = None  # equity minus deposits at the last review of any kind
         self.last_event_review = 0.0
-        self.event_cooldown = 30 * 60  # at most one stop-triggered review per half hour
+        self.event_cooldown = 30 * 60  # at most one unscheduled review per half hour
         self._agent: PortfolioAgent | None = None
         universe.restore(settings)
 
@@ -895,7 +896,17 @@ class AutoPilot:
         self.executor.journal.write("playbook", source="rules", allocations=pb["allocations"], warnings=warnings)
         self.log(f"playbook set by rules: {len(pb['allocations'])} allocation(s)" + ("" if pb["allocations"] else " (nothing passed the bar, staying flat)"))
 
-    def manage(self, card: dict, fresh_research: bool, event: str = "") -> None:
+    STOP_ASK = (
+        "Work out why it happened and whether the reason for the trade is finished or has reversed, then decide what "
+        "the account should hold now: stay out, re-enter the same way, or take the other side. "
+    )
+    MOVE_ASK = (
+        "Work out what drove it and whether the reasons for the open trades still hold, then decide: bank some or all "
+        "of a gain, cut what is not working, move stops, change sizes, or leave everything alone. Leaving it alone is "
+        "the right answer when the thesis is intact and the move is ordinary noise; do not trade just because you were asked. "
+    )
+
+    def manage(self, card: dict, fresh_research: bool, event: str = "", ask: str = STOP_ASK) -> None:
         """Let the LLM (or the fallback rule) decide the playbook. `event` says why, if it is not a routine review."""
         self.last_review = time.time()
         if not self.use_llm:
@@ -907,11 +918,7 @@ class AutoPilot:
                 self._agent = PortfolioAgent(self.s, self.executor, runner=self.runner, on_event=self.on_event, lock=self.lock)
             self._agent.task = PortfolioAgent.task
             if event:
-                self._agent.task = (
-                    f"This is an unscheduled review because {event}. Work out why it happened and whether the reason for "
-                    "the trade is finished or has reversed, then decide what the account should hold now: stay out, "
-                    "re-enter the same way, or take the other side. " + PortfolioAgent.task
-                )
+                self._agent.task = f"This is an unscheduled review because {event}. " + ask + PortfolioAgent.task
             summary = self._agent.run_cycle()
             self.log(f"manager report (AI cost ${summary['cost_usd']:.4f}, ended: {summary['stop_reason']}):\n" + summary["report"])
         except AgentError as e:
@@ -953,18 +960,27 @@ class AutoPilot:
         resized = self.last_review_equity > 0 and abs(equity / self.last_review_equity - 1) > 0.25
         if resized:
             self.log(f"account size changed from ${self.last_review_equity:,.2f} to ${equity:,.2f}: reviewing the playbook")
+        profit = equity - (self.executor._deposits() or 0.0)  # deposits and withdrawals are not profit or loss
         if fresh or resized or load_playbook(self.s) is None or time.time() - self.last_review > self.review_seconds:
-            self.last_review_equity = equity
+            self.last_review_equity, self.last_review_profit = equity, profit
             self.manage(card, fresh)
         with self.lock:  # only the part that trades holds the account lock
             results = self.runner.step(load_playbook(self.s))
         event, self.runner.review_requested = self.runner.review_requested, None
+        ask = self.STOP_ASK
+        if not event and self.s.review_move_pct > 0 and self.last_review_profit is not None and self.last_review_equity > 0:
+            # A sharp gain or loss between scheduled reviews is a decision point too: bank it, cut it or hold.
+            move = (profit - self.last_review_profit) / self.last_review_equity * 100
+            if abs(move) >= self.s.review_move_pct:
+                event = f"the account has {'gained' if move > 0 else 'lost'} {abs(move):.1f}% of its equity (now ${equity:,.2f}) since your last review"
+                ask = self.MOVE_ASK
         if event and time.time() - self.last_event_review >= self.event_cooldown:
-            # A position was closed without the manager choosing it: decide straight away what comes
-            # next instead of sitting flat until the scheduled review.
+            # Something happened that the manager did not choose: decide straight away what comes
+            # next instead of waiting for the scheduled review.
             self.last_event_review = time.time()
+            self.last_review_equity, self.last_review_profit = equity, profit
             self.log(f"{event}: reviewing now")
-            self.manage(card, False, event=event)
+            self.manage(card, False, event=event, ask=ask)
             with self.lock:
                 results = self.runner.step(load_playbook(self.s))
         return results

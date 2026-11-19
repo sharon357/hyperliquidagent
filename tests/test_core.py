@@ -1001,7 +1001,7 @@ def test_stop_out_triggers_an_immediate_review_with_cooldown(stack, monkeypatch)
     pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
     reviews = []
     original = pilot.manage
-    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="": (reviews.append(event), original(c, fresh, event))[1])
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (reviews.append(event), original(c, fresh, event, **k))[1])
 
     pilot.tick()
     assert "BTC" in broker.account().positions and reviews == [""]  # the first, routine review
@@ -1021,3 +1021,43 @@ def test_stop_out_triggers_an_immediate_review_with_cooldown(stack, monkeypatch)
     data.prices["BTC"] = 80.0
     pilot.tick()
     assert "BTC" not in broker.account().positions and len(reviews) == 2
+
+
+def test_sharp_equity_move_triggers_a_review_with_cooldown(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct = 50.0, 80.0, 3.0
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    reviews = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (reviews.append((event, k.get("ask", ""))), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    weight = broker.account().positions["BTC"].notional / 10_000
+    assert weight > 0.1 and len(reviews) == 1
+    data.prices["BTC"] = 100 * (1 + 0.01 / weight)  # +1% of equity: ordinary noise
+    pilot.tick()
+    assert len(reviews) == 1
+    data.prices["BTC"] = 100 * (1 + 0.04 / weight)  # +4% of equity since the last review
+    pilot.tick()
+    assert len(reviews) == 2 and "gained 4.0%" in reviews[1][0] and reviews[1][1] == pilot.MOVE_ASK
+    pilot.tick()
+    assert len(reviews) == 2  # measured from the review just held, so no repeat
+    data.prices["BTC"] = 100 * (1 + 0.005 / weight)  # gives 3.5% back, but inside the half-hour cooldown
+    pilot.tick()
+    assert len(reviews) == 2
+    pilot.last_event_review = 0.0
+    pilot.tick()
+    assert len(reviews) == 3 and "lost" in reviews[2][0]
+    s.review_move_pct = 0.0  # off
+    pilot.last_event_review = 0.0
+    data.prices["BTC"] = 100 * (1 + 0.06 / weight)
+    pilot.tick()
+    assert len(reviews) == 3

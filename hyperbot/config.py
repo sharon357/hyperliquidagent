@@ -68,6 +68,7 @@ class Settings:
     max_stop_loss_pct: float = 10.0
     rebalance_band: float = 0.10  # ignore resizes smaller than 10 % of the position
     require_stop: bool = True  # every position must carry a stop-loss
+    review_move_pct: float = 3.0  # extra manager review when profit or loss moves this many percent of equity since the last one (0 = off)
     default_trail_mult: float = 0.0  # trailing used when a trade does not set its own: this many times its stop distance (0 = none)
     ai_sets_limits: bool = False  # let the AI manager change the risk limits itself, inside fixed outer bounds
     exposure_multiplier: float = 1.0  # autopilot only: scales every playbook position (still capped by max_leverage)
@@ -152,6 +153,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         rebalance_band=_float("HL_REBALANCE_BAND", d.rebalance_band),
         require_stop=_bool("HL_REQUIRE_STOP", d.require_stop),
         default_trail_mult=_float("HL_DEFAULT_TRAIL_MULT", d.default_trail_mult),
+        review_move_pct=_float("HL_REVIEW_MOVE_PCT", d.review_move_pct),
         ai_sets_limits=_bool("HL_AI_SETS_LIMITS", d.ai_sets_limits),
         exposure_multiplier=_float("HL_EXPOSURE_MULTIPLIER", d.exposure_multiplier),
         llm_api_key=(os.getenv("HL_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip(),
