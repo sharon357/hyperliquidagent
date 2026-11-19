@@ -267,9 +267,23 @@ class HyperliquidBroker(Broker):
                 float(p.get("unrealizedPnl") or 0),
                 float(liq) if liq else None,
             )
-        return AccountState(
-            float(ms["accountValue"]), float(st.get("withdrawable", 0)), float(ms["totalMarginUsed"]), positions
-        )
+        equity = float(ms["accountValue"])
+        free = float(st.get("withdrawable", 0))
+        margin = float(ms["totalMarginUsed"])
+        # Unified accounts hold collateral as spot USDC, so the perps summary reads $0.
+        try:
+            spot = self.info.spot_user_state(self.address)
+            usdc = next((b for b in spot.get("balances", []) if b.get("coin") == "USDC"), None)
+            if usdc:
+                total, hold = float(usdc["total"]), float(usdc.get("hold", 0))
+                spot_equity = total + sum(p.unrealized_pnl for p in positions.values())
+                if spot_equity > equity:
+                    equity = spot_equity
+                    free = max(free, total - hold)
+                    margin = max(margin, hold)
+        except Exception:
+            pass
+        return AccountState(equity, free, margin, positions)
 
     def _round_size(self, coin: str, units: float) -> float:
         return round(abs(units), self._sz_decimals.get(coin, 4))
