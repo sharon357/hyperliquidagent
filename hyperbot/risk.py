@@ -265,6 +265,12 @@ class RiskManager:
                 if s.default_trail_mult > 0
                 else "none unless a trade sets its own"
             ),
+            "owner_trailing_cap": (
+                f"every position trails at most {s.max_trail_pct:g}% behind its best price and moves to break-even "
+                f"once {s.max_trail_pct:g}% in profit at the latest; a trade may set tighter values, never wider or off"
+                if s.max_trail_pct > 0
+                else "none"
+            ),
             "limits_set_by": "the AI manager, inside fixed outer bounds" if s.ai_sets_limits else "the owner",
             "autopilot_exposure_multiplier": s.exposure_multiplier,
         }

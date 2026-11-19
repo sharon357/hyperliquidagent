@@ -1061,3 +1061,25 @@ def test_sharp_equity_move_triggers_a_review_with_cooldown(stack, monkeypatch):
     data.prices["BTC"] = 100 * (1 + 0.06 / weight)
     pilot.tick()
     assert len(reviews) == 3
+
+
+def test_owner_trailing_cap_overrides_wider_or_off_settings(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.max_trail_pct = 3.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    wide = {"interval": "4h", "strategy": "hold_short", "weight": 0.3, "stop_loss_pct": 5, "take_profit_pct": 0}
+    pb, _ = auto.make_playbook(s, None, [{**wide, "coin": "BTC", "trail_pct": 8, "breakeven_at_pct": -1}, {**wide, "coin": "ETH", "trail_pct": -1, "breakeven_at_pct": -1}])
+    runner.step(pb)
+    data.prices["BTC"], data.prices["ETH"] = 96.0, 9.6  # shorts from 100 and 10, now +4%
+    runner.step(pb)
+    for coin, entry in (("BTC", 100.0), ("ETH", 10.0)):
+        stop = broker.get_protection(coin)["stop_px"]
+        assert stop == pytest.approx(entry * 0.96 * 1.03) and stop < entry  # 3% behind the best price: profit is locked
+    tight, _ = auto.make_playbook(s, None, [{**wide, "coin": "BTC", "trail_pct": 1, "breakeven_at_pct": 1}])
+    runner.step(tight)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(96.0 * 1.01)  # tighter than the cap is allowed
+    assert "at most 3%" in ex.risk.limits()["owner_trailing_cap"]
