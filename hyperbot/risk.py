@@ -8,6 +8,7 @@ way past them.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,101 @@ from .exchange import AccountState, Broker
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+# The AI manager may move the risk limits, but only inside these outer bounds. They are
+# deliberately not adjustable by the model: text it reads from the internet could try to
+# talk it into switching protection off, and this is what still stands if that works.
+LIMIT_BOUNDS = {
+    "max_leverage": (1.0, 20.0),
+    "max_position_pct": (50.0, 2000.0),
+    "max_alt_position_pct": (25.0, 2000.0),
+    "max_daily_loss_pct": (2.0, 50.0),
+    "max_drawdown_pct": (5.0, 80.0),
+    "max_trades_per_day": (5, 100),
+    "max_stop_loss_pct": (2.0, 50.0),
+}
+
+
+def _overrides_path(settings: Settings) -> Path:
+    return Path(settings.state_dir) / "risk_overrides.json"
+
+
+def apply_limit_overrides(settings: Settings) -> dict:
+    """Load limits the AI manager set earlier onto the live settings. Returns what was applied."""
+    p = _overrides_path(settings)
+    if not settings.ai_sets_limits or not p.is_file():
+        return {}
+    saved = json.loads(p.read_text(encoding="utf-8"))
+    for key, value in saved.get("limits", {}).items():
+        if key in LIMIT_BOUNDS or key == "require_stop":
+            setattr(settings, key, value)
+    return saved
+
+
+def set_limit_overrides(settings: Settings, requested: dict, rationale: str = "") -> dict:
+    """Change risk limits at the AI manager's request, clamped to LIMIT_BOUNDS."""
+    if not settings.ai_sets_limits:
+        return {"error": "the owner has fixed the risk limits (HL_AI_SETS_LIMITS is off)"}
+    applied, notes = {}, []
+    for key, (lo, hi) in LIMIT_BOUNDS.items():
+        if requested.get(key) in (None, "", 0):
+            continue
+        try:
+            value = float(requested[key])
+        except (TypeError, ValueError):
+            notes.append(f"{key}: not a number, ignored")
+            continue
+        clamped = min(max(value, lo), hi)
+        if clamped != value:
+            notes.append(f"{key}: {value:g} is outside the allowed range, set to {clamped:g}")
+        applied[key] = int(clamped) if isinstance(lo, int) else clamped
+    if isinstance(requested.get("require_stop"), bool):
+        applied["require_stop"] = requested["require_stop"]
+    for key, value in applied.items():
+        setattr(settings, key, value)
+    p = _overrides_path(settings)
+    saved = json.loads(p.read_text(encoding="utf-8")) if p.is_file() else {"limits": {}}
+    saved["limits"].update(applied)
+    saved.update(updated=utc_now().isoformat(timespec="seconds"), rationale=str(rationale)[:800])
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(saved, indent=2), encoding="utf-8")
+    return {"status": "saved", "applied": applied, "notes": notes, "outer_bounds": LIMIT_BOUNDS}
+
+
+class AICostLedger:
+    """Running total of what the LLM has cost, kept next to the account it trades."""
+
+    def __init__(self, settings: Settings):
+        self.s = settings
+        self.path = Path(settings.state_dir) / "llm_usage.json"
+
+    def load(self) -> dict:
+        if self.path.is_file():
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        return {"calls": 0, "cycles": 0, "prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0}
+
+    def price(self, prompt: int, cached: int, completion: int) -> float:
+        s = self.s
+        fresh = max(prompt - cached, 0)
+        return (fresh * s.llm_price_input + cached * s.llm_price_input_cached + completion * s.llm_price_output) / 1e6
+
+    def add(self, prompt: int, cached: int, completion: int, calls: int) -> float:
+        """Record one decision cycle's usage. Returns that cycle's cost in USD."""
+        cost = self.price(prompt, cached, completion)
+        d = self.load()
+        d["calls"] += calls
+        d["cycles"] += 1
+        d["prompt_tokens"] += prompt
+        d["cached_tokens"] += cached
+        d["completion_tokens"] += completion
+        d["cost_usd"] = round(d["cost_usd"] + cost, 6)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(d, indent=2), encoding="utf-8")
+        return cost
+
+    def total(self) -> float:
+        return float(self.load()["cost_usd"])
 
 
 class Journal:
@@ -59,19 +155,51 @@ class RiskManager:
         self.s = settings
         self.path = Path(settings.state_dir) / "risk_state.json"
         self.state = self._load()
+        apply_limit_overrides(settings)
 
     def _load(self) -> dict:
         if self.path.is_file():
             return json.loads(self.path.read_text(encoding="utf-8"))
-        return {"day": "", "day_start_equity": 0.0, "high_water_mark": 0.0, "trades_today": 0, "halted": False, "halt_reason": ""}
+        return {"day": "", "day_start_equity": 0.0, "high_water_mark": 0.0, "trades_today": 0, "halted": False, "halt_reason": "", "baseline_equity": 0.0}
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
 
-    def update(self, equity: float) -> None:
-        """Roll the daily counters and trip the kill switch on a drawdown breach."""
+    def update(self, equity: float, net_deposits: float | None = None) -> None:
+        """Roll the daily counters and trip the kill switch on a drawdown breach.
+
+        `net_deposits` (live accounts) is everything paid in minus everything taken out.
+        When it changes, the day's starting balance and the high-water mark move by the
+        same amount, so a deposit is not read as profit and a withdrawal is not read as a loss.
+        """
+        if net_deposits is not None:
+            if "net_deposits" not in self.state:
+                # First time this account is tracked with deposits: restart the reference points here.
+                self.state.update(net_deposits=net_deposits, day_start_equity=equity)
+                self.state["high_water_mark"] = max(self.state.get("high_water_mark", 0.0), equity)
+            elif abs(net_deposits - self.state["net_deposits"]) > 1e-6:
+                moved = net_deposits - self.state["net_deposits"]
+                self.state["net_deposits"] = net_deposits
+                self.state["day_start_equity"] = max(self.state["day_start_equity"] + moved, 0.0)
+                jump = self.state.pop("unexplained_jump", None)
+                if jump and moved > 0 and jump["amount"] >= 0.8 * moved and time.time() - jump["time"] < 900:
+                    # The balance showed this deposit before the ledger did, and the high-water mark
+                    # already rose with it. Shifting it again would count the deposit twice and read
+                    # as a huge drawdown, so rebuild it from where it stood before the money arrived.
+                    self.state["high_water_mark"] = max(jump["hwm_before"] + moved, 0.0)
+                else:
+                    self.state["high_water_mark"] = max(self.state["high_water_mark"] + moved, 0.0)
+            else:
+                last = self.state.get("last_equity")
+                if last and equity - last > 0.05 * last:
+                    # Up more than 5% between two looks with no deposit on the ledger: remember where
+                    # the high-water mark stood, in case this turns out to be a deposit reported late.
+                    self.state["unexplained_jump"] = {"amount": equity - last, "time": time.time(), "hwm_before": self.state["high_water_mark"]}
         today = utc_now().strftime("%Y-%m-%d")
+        if not self.state.get("baseline_equity") and equity > 0:
+            # Equity when the bot first saw the account: the starting point for profit and loss.
+            self.state.update(baseline_equity=equity, baseline_time=utc_now().isoformat(timespec="seconds"))
         if self.state["day"] != today:
             self.state.update(day=today, day_start_equity=equity, trades_today=0)
         if equity > self.state["high_water_mark"]:
@@ -81,6 +209,7 @@ class RiskManager:
             dd = (1 - equity / hwm) * 100
             if dd >= self.s.max_drawdown_pct:
                 self.halt(f"drawdown {dd:.1f}% from the high-water mark reached the {self.s.max_drawdown_pct}% limit")
+        self.state["last_equity"] = equity
         self._save()
 
     def halt(self, reason: str) -> None:
@@ -92,6 +221,26 @@ class RiskManager:
         if equity is not None:
             self.state["high_water_mark"] = equity  # restart drawdown tracking from here
         self._save()
+
+    def pnl(self, equity: float, net_deposits: float | None = None) -> dict:
+        """Profit and loss, before and after the LLM bill.
+
+        With `net_deposits` (live accounts) profit is equity minus everything paid in,
+        so topping up the account is not mistaken for a gain.
+        """
+        base = net_deposits if net_deposits else (self.state.get("baseline_equity") or equity)
+        gross = equity - base
+        ai = AICostLedger(self.s).total()
+        net = gross - ai
+        return {
+            "since": self.state.get("baseline_time", ""),
+            "starting_equity_usd": round(base, 2),
+            "trading_pnl_usd": round(gross, 2),
+            "ai_cost_usd": round(ai, 4),
+            "net_pnl_usd": round(net, 2),
+            "net_return_pct": round(net / base * 100, 3) if base else 0.0,
+            "note": "trading PnL already includes fees, slippage and funding; deposits or withdrawals after the start distort it",
+        }
 
     def daily_pnl_pct(self, equity: float) -> float:
         start = self.state["day_start_equity"]
@@ -118,11 +267,51 @@ class RiskManager:
             "allowed_coins": s.coins,
             "max_leverage": s.max_leverage,
             "max_position_pct_of_equity": s.max_position_pct,
+            "max_position_pct_for_non_core_coins": min(s.max_position_pct, s.max_alt_position_pct),
+            "core_coins": s.core_coins or s.coins,
             "max_daily_loss_pct": s.max_daily_loss_pct,
             "max_drawdown_pct": s.max_drawdown_pct,
             "max_trades_per_day": s.max_trades_per_day,
             "min_order_usd": s.min_order_usd,
             "max_stop_loss_pct": s.max_stop_loss_pct,
+            "stop_loss_required": s.require_stop,
+            "default_trailing": (
+                f"trail and break-even at {s.default_trail_mult:g}x the stop distance unless a trade sets its own"
+                if s.default_trail_mult > 0
+                else "none unless a trade sets its own"
+            ),
+            "owner_profit_target": (
+                f"{s.profit_target_pct:g}% of the account per day, banked: each time the account has gained "
+                f"{s.profit_target_pct:g}% since the last bank the engine "
+                + (
+                    "closes every position, then calls you to rebuild from flat"
+                    if s.bank_fraction >= 1
+                    else f"closes {s.bank_fraction:.0%} of every position, moves the stops on what is left to break-even where it can, and calls you to redeploy the freed capital"
+                )
+                if s.profit_target_pct > 0
+                else "none"
+            ),
+            "day_trading_sleeve": (
+                f"allocations on {', '.join(s.day_intervals)} candles form the day-trading sleeve; the engine switches the whole sleeve off until the next UTC day once it has "
+                + " or ".join(
+                    x
+                    for x in (
+                        f"made {s.day_target_pct:g}% of the account" if s.day_target_pct > 0 else "",
+                        f"lost {s.day_stop_pct:g}% of the account" if s.day_stop_pct > 0 else "",
+                    )
+                    if x
+                )
+                if s.day_intervals and (s.day_target_pct > 0 or s.day_stop_pct > 0)
+                else (f"allocations on {', '.join(s.day_intervals)} candles" if s.day_intervals else "none")
+            ),
+            "owner_trailing_cap": (
+                f"every position trails at most {s.max_trail_pct:g}% behind its best price and moves to break-even "
+                f"once {s.max_trail_pct:g}% in profit at the latest; a trade may set tighter values, never wider or off"
+                if s.max_trail_pct > 0
+                else "none"
+            ),
+            "limits_set_by": "the AI manager, inside fixed outer bounds" if s.ai_sets_limits else "the owner",
+            "autopilot_exposure_multiplier": s.exposure_multiplier,
         }
 
     def check(self, coin: str, target_usd: float, account: AccountState) -> RiskDecision:
@@ -147,7 +336,10 @@ class RiskManager:
 
         sign = 1 if target_usd > 0 else -1
         size = abs(target_usd)
-        per_coin_cap = equity * s.max_position_pct / 100
+        cap_pct = s.max_position_pct
+        if s.core_coins and coin not in s.core_coins:
+            cap_pct = min(cap_pct, s.max_alt_position_pct)  # smaller, thinner coins get a tighter cap
+        per_coin_cap = equity * cap_pct / 100
         if size > per_coin_cap:
             notes.append(f"clamped to the per-coin cap of ${per_coin_cap:,.0f}")
             size = per_coin_cap
@@ -171,10 +363,23 @@ class Executor:
         self.journal = journal
         self.dry_run = dry_run
 
+    def _deposits(self) -> float | None:
+        return getattr(self.broker, "net_deposits", lambda: None)()
+
     def account(self) -> AccountState:
         acct = self.broker.account()
-        self.risk.update(acct.equity)
+        deposits = self._deposits()
+        last = self.risk.state.get("last_equity")
+        if deposits is not None and last and abs(acct.equity - last) > 0.05 * last and hasattr(self.broker, "_deposit_cache"):
+            # A move this size between two looks is more likely money going in or out than trading:
+            # read the ledger again now instead of trusting a figure cached up to a minute ago.
+            self.broker._deposit_cache = None
+            deposits = self._deposits()
+        self.risk.update(acct.equity, deposits)
         return acct
+
+    def pnl_report(self, equity: float) -> dict:
+        return self.risk.pnl(equity, self._deposits())
 
     def set_target(
         self,
@@ -198,9 +403,13 @@ class Executor:
 
         if target_usd != 0:
             if not stop_loss_pct or stop_loss_pct <= 0:
-                stop_loss_pct = s.default_stop_loss_pct
-                result["note_stop"] = f"no stop given, using the default {stop_loss_pct}%"
-            if stop_loss_pct > s.max_stop_loss_pct:
+                if s.require_stop:
+                    stop_loss_pct = s.default_stop_loss_pct
+                    result["note_stop"] = f"no stop given, using the default {stop_loss_pct}%"
+                else:
+                    stop_loss_pct = None
+                    result["note_stop"] = "no stop-loss on this position"
+            if stop_loss_pct and stop_loss_pct > s.max_stop_loss_pct:
                 stop_loss_pct = s.max_stop_loss_pct
                 result["note_stop"] = f"stop clamped to the maximum {stop_loss_pct}%"
 
@@ -226,7 +435,9 @@ class Executor:
             result.update(status="noop", detail="already flat")
             return result
 
-        if not trade_needed and not refresh_protection and self.broker.get_protection(coin).get("stop_px"):
+        if not trade_needed and not refresh_protection and (
+            not stop_loss_pct or self.broker.get_protection(coin).get("stop_px")
+        ):
             # Leave the existing stop where it is: re-placing it every tick would
             # drag it away from a falling price and it would never trigger.
             result.update(status="hold")
@@ -273,12 +484,14 @@ class Executor:
             pos = self.broker.account().positions.get(coin)
             if pos:
                 long = pos.size > 0
-                stop_px = pos.mark_px * (1 - stop_loss_pct / 100 if long else 1 + stop_loss_pct / 100)
+                stop_px = None
+                if stop_loss_pct:
+                    stop_px = pos.mark_px * (1 - stop_loss_pct / 100 if long else 1 + stop_loss_pct / 100)
                 tp_px = None
                 if take_profit_pct and take_profit_pct > 0:
                     tp_px = pos.mark_px * (1 + take_profit_pct / 100 if long else 1 - take_profit_pct / 100)
                 errors = self.broker.set_protection(coin, stop_px, tp_px)
-                result["stop_px"] = round(stop_px, 6)
+                result["stop_px"] = round(stop_px, 6) if stop_px else None
                 result["take_profit_px"] = round(tp_px, 6) if tp_px else None
                 if errors:
                     result["protection_errors"] = errors

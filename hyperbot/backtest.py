@@ -25,6 +25,9 @@ class BacktestConfig:
     slippage_bps: float = 2.0
     stop_loss_pct: float | None = None  # % from the average entry price
     take_profit_pct: float | None = None
+    trail_pct: float | None = None  # trailing stop: this far behind the best price since entry
+    breakeven_at_pct: float | None = None  # once this far in profit, the stop is at least the entry
+    max_hold_bars: int | None = None  # time limit: close a trade that is still open after this many bars
     maintenance_margin: float = 0.02  # liquidated when equity < this share of notional
     rebalance_threshold: float = 0.1  # smallest change in target exposure worth trading
     allow_short: bool = True
@@ -74,6 +77,10 @@ def run_backtest(
     slip = cfg.slippage_bps / 1e4
     sl = cfg.stop_loss_pct / 100 if cfg.stop_loss_pct else None
     tp = cfg.take_profit_pct / 100 if cfg.take_profit_pct else None
+    trail = cfg.trail_pct / 100 if cfg.trail_pct else None
+    breakeven = cfg.breakeven_at_pct / 100 if cfg.breakeven_at_pct else None
+    entry_bar = [0]  # bar index at which the open trade started
+    best_px = 0.0  # best price since entry, as of the previous bar (so a bar's high cannot rescue its own low)
     mm = cfg.maintenance_margin
 
     equity = cfg.initial_equity
@@ -87,7 +94,7 @@ def run_backtest(
     open_trade: dict | None = None
 
     def trade_to(desired: float, price: float, i: int, reason: str) -> None:
-        nonlocal equity, units, entry_px, fees, slippage_cost, open_trade
+        nonlocal equity, units, entry_px, fees, slippage_cost, open_trade, best_px
         delta = desired - units
         if delta == 0:
             return
@@ -97,6 +104,8 @@ def run_backtest(
         slippage_cost += notional * slip
         if units == 0:  # opening
             entry_px = price
+            best_px = price
+            entry_bar[0] = i
             open_trade = {
                 "entry_time": times[i],
                 "side": "long" if desired > 0 else "short",
@@ -132,18 +141,26 @@ def run_backtest(
         reason = ""
         if long:
             stop_px = entry_px * (1 - sl) if sl else -np.inf
+            if trail:
+                stop_px = max(stop_px, best_px * (1 - trail))
+            if breakeven and best_px >= entry_px * (1 + breakeven):
+                stop_px = max(stop_px, entry_px * 1.001)
             trigger = max(stop_px, liq_px)
             if lo <= trigger:
                 hit_px = min(trigger, hi)
-                reason = "liquidation" if liq_px >= stop_px else "stop_loss"
+                reason = "liquidation" if liq_px >= stop_px else ("trailing_stop" if stop_px > entry_px * (1 - (sl or 1)) else "stop_loss")
             elif tp and hi >= entry_px * (1 + tp):
                 hit_px, reason = max(entry_px * (1 + tp), lo), "take_profit"
         else:
             stop_px = entry_px * (1 + sl) if sl else np.inf
+            if trail:
+                stop_px = min(stop_px, best_px * (1 + trail))
+            if breakeven and best_px <= entry_px * (1 - breakeven):
+                stop_px = min(stop_px, entry_px * 0.999)
             trigger = min(stop_px, liq_px) if liq_px > 0 else stop_px
             if hi >= trigger:
                 hit_px = max(trigger, lo)
-                reason = "liquidation" if 0 < liq_px <= stop_px else "stop_loss"
+                reason = "liquidation" if 0 < liq_px <= stop_px else ("trailing_stop" if stop_px < entry_px * (1 + (sl or 1e9)) else "stop_loss")
             elif tp and lo <= entry_px * (1 - tp):
                 hit_px, reason = min(entry_px * (1 - tp), hi), "take_profit"
         if hit_px is None:
@@ -153,7 +170,7 @@ def run_backtest(
         trade_to(0.0, hit_px, i, reason)
         last_target = 0.0
         if reason != "take_profit":
-            blocked = side
+            blocked = side  # as live: stay out until the signal changes side
         if reason == "liquidation":
             liquidations += 1
 
@@ -180,10 +197,16 @@ def run_backtest(
 
         protect(low[i], h[i], o[i], i)
         if units:
+            best_px = max(best_px, h[i]) if units > 0 else min(best_px, low[i])
             equity += units * (c[i] - o[i])
             pay = units * c[i] * f[i]  # longs pay when funding is positive
             equity -= pay
             funding_paid += pay
+        if units and cfg.max_hold_bars and i - entry_bar[0] >= cfg.max_hold_bars:
+            side = np.sign(units)
+            trade_to(0.0, c[i], i, "time_limit")  # the idea has had its time: exit at the close
+            last_target = 0.0
+            blocked = side
         prev_close = c[i]
         if equity <= 0:
             equity = 0.0
@@ -279,13 +302,20 @@ def grid_search(
     metric: str = "sharpe",
     min_trades: int = 5,
     trade_from: pd.Timestamp | None = None,
+    returns_out: dict | None = None,
 ) -> pd.DataFrame:
-    """Backtest every parameter combination. Sorted best-first by `metric`."""
+    """Backtest every parameter combination. Sorted best-first by `metric`.
+
+    Pass a dict as `returns_out` to also collect every trial's per-bar returns
+    (needed to estimate the probability of backtest overfitting).
+    """
     base = get_strategy(strategy_name)
     rows = []
-    for params in expand_grid(grid if grid is not None else base.grid):
+    for i, params in enumerate(expand_grid(grid if grid is not None else base.grid)):
         res = run_backtest(df, get_strategy(strategy_name, **params), cfg, trade_from)
         rows.append({**params, **res.metrics})
+        if returns_out is not None:
+            returns_out[i] = res.equity.pct_change().fillna(0.0)
     out = pd.DataFrame(rows)
     out["eligible"] = out["trades"] >= min_trades
     return out.sort_values(["eligible", metric], ascending=[False, False]).reset_index(drop=True)
@@ -299,6 +329,7 @@ def walk_forward(
     n_splits: int = 4,
     metric: str = "sharpe",
     min_trades: int = 3,
+    embargo: int | None = None,
 ) -> dict:
     """Expanding-window walk-forward test.
 
@@ -315,8 +346,11 @@ def walk_forward(
     folds = []
     oos_returns = []
     oos_trades = []
+    # Embargo: leave a gap between the data parameters are chosen on and the data they are
+    # tested on, so trades and indicator windows straddling the boundary cannot leak across it.
+    embargo = max(1, n // 100) if embargo is None else embargo
     for k in range(1, n_splits + 1):
-        train = df.iloc[: k * seg]
+        train = df.iloc[: max(k * seg - embargo, 50)]
         test_end = (k + 1) * seg if k < n_splits else n
         test_start_time = df.index[k * seg]
         ranked = grid_search(train, strategy_name, cfg, grid, metric, min_trades)

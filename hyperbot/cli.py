@@ -74,13 +74,22 @@ def _load(settings: Settings, coin: str, interval: str, days: float, source: str
     return df
 
 
-def _cfg(settings: Settings, leverage: float, sl: Optional[float], tp: Optional[float]) -> BacktestConfig:
+def _cfg(
+    settings: Settings,
+    leverage: float,
+    sl: Optional[float],
+    tp: Optional[float],
+    trail: Optional[float] = None,
+    breakeven: Optional[float] = None,
+) -> BacktestConfig:
     return BacktestConfig(
         leverage=leverage,
         taker_fee=settings.taker_fee,
         slippage_bps=settings.slippage_bps,
         stop_loss_pct=sl,
         take_profit_pct=tp,
+        trail_pct=trail,
+        breakeven_at_pct=breakeven,
     )
 
 
@@ -157,6 +166,8 @@ def backtest(
     param: Optional[list[str]] = O_PARAM,
     stop_loss: Optional[float] = O_SL,
     take_profit: Optional[float] = O_TP,
+    trail: Optional[float] = typer.Option(None, "--trail", help="Trailing stop distance in percent"),
+    breakeven: Optional[float] = typer.Option(None, "--breakeven", help="Move the stop to entry after this profit in percent"),
     report: bool = typer.Option(True, help="Write an HTML report and a trades CSV to reports/"),
 ):
     """Backtest one strategy on one coin."""
@@ -166,7 +177,7 @@ def backtest(
     coin = coin.upper()
     df = _load(s, coin, interval, days, source, csv)
     strat = get_strategy(strategy, **_params(param))
-    res = run_backtest(df, strat, _cfg(s, leverage, stop_loss, take_profit))
+    res = run_backtest(df, strat, _cfg(s, leverage, stop_loss, take_profit, trail, breakeven))
     console.print(_metrics_table(res.metrics, f"{strat!r} on {coin} {interval}, {len(df)} bars"))
     if report:
         base = s.reports_dir / f"{coin}_{interval}_{strategy}"
@@ -299,6 +310,9 @@ def status():
     console.print(_metrics_table(d, "Account"))
     if positions:
         console.print(_table(pd.DataFrame(positions), "Positions"))
+    pnl = executor.pnl_report(acct.equity)
+    pnl.pop("note")
+    console.print(_metrics_table(pnl, "Profit and loss (net = trading PnL minus AI cost)"))
     risk = executor.risk.status(acct.equity)
     limits = risk.pop("limits")
     console.print(_metrics_table(risk, "Risk state"))
@@ -368,7 +382,10 @@ def paper_reset():
 
     s = load_settings()
     PaperBroker(s).reset()
-    RiskManager(s).resume(s.paper_equity)
+    rm = RiskManager(s)
+    rm.state["baseline_equity"] = 0.0  # profit and loss start again from the new balance
+    rm.resume(s.paper_equity)
+    (s.state_dir / "llm_usage.json").unlink(missing_ok=True)
     console.print(f"Paper account reset to ${s.paper_equity:,.0f}.")
 
 
@@ -449,7 +466,7 @@ def agent(
         summary = bot.run_cycle()
         console.print(Panel(summary["report"], title="Agent report", title_align="left"))
         u = summary["usage"]
-        console.log(f"{len(summary['actions'])} trade action(s); tokens in {u['prompt_tokens']:,} / out {u['completion_tokens']:,}")
+        console.log(f"{len(summary['actions'])} trade action(s); tokens in {u['prompt_tokens']:,} / out {u['completion_tokens']:,}; AI cost ${summary['cost_usd']:.4f}")
 
     if once:
         try:
@@ -468,10 +485,15 @@ def _show_scorecard(card: dict, top: int) -> None:
         return
     df["live_params"] = df["live_params"].map(lambda p: ", ".join(f"{k}={v}" for k, v in p.items()))
     df["folds+"] = df["oos_folds_positive"].astype(str) + "/" + df["oos_folds"].astype(str)
-    cols = ["coin", "interval", "strategy", "oos_return_pct", "oos_sharpe", "oos_max_dd_pct", "folds+", "oos_trades",
-            "fitted_return_pct", "buy_hold_return_pct", "current_signal", "live_params"]
+    cols = ["coin", "interval", "strategy", "oos_return_pct", "oos_sharpe", "psr", "dsr", "pbo", "half_kelly", "oos_max_dd_pct", "folds+",
+            "oos_trades", "fitted_return_pct", "current_signal", "live_params"]
+    cols = [c for c in cols if c in df.columns]
     console.print(_table(df[cols].head(top), f"Research scorecard ({card['generated']}, {card['days']:g} days): top {min(top, len(df))} of {len(df)} by out-of-sample Sharpe"))
-    console.print("oos = walk-forward on unseen data (the honest number); fitted = best parameters picked with hindsight.")
+    console.print(
+        "oos = walk-forward on unseen data (the honest number); fitted = best parameters picked with hindsight.\n"
+        "psr = chance the true Sharpe is above zero; dsr = the same after allowing for how many candidates were tested; "
+        "half_kelly = leverage ceiling for that strategy; pbo = probability the tuned parameters are overfit (0.5+ = no better than chance)."
+    )
 
 
 def _show_playbook(pb: Optional[dict]) -> None:
@@ -552,7 +574,7 @@ def auto(
                     f"{r.get('error') or r.get('risk_notes') or ''} {r.get('protection_errors') or ''}".strip()
                 )
         console.log(
-            f"equity ${acct.equity:,.2f}, {len(acct.positions)} position(s), "
+            f"equity ${acct.equity:,.2f}, net PnL after AI cost ${pnl['net_pnl_usd']:+,.2f} (AI ${pnl['ai_cost_usd']:.2f}), {len(acct.positions)} position(s), "
             + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
         )
 
@@ -561,6 +583,197 @@ def auto(
         _show_playbook(load_playbook(s))
     else:
         run_forever(step, parse_duration(tick), console.log)
+
+
+@app.command()
+def simulate(
+    amount: float = typer.Option(10_000.0, "--amount", "-a", help="Starting balance in USD"),
+    name: str = typer.Option("default", "--name", help="Run several simulations side by side under different names"),
+    tick: str = typer.Option("5m", "--tick"),
+    review_every: str = typer.Option("4h", "--review-every"),
+    research_every: str = typer.Option("24h", "--research-every"),
+    no_llm: bool = typer.Option(False, "--no-llm", help="Pick strategies by the fixed rule instead of the LLM"),
+    once: bool = typer.Option(False, "--once", help="Run a single tick and exit"),
+    report: bool = typer.Option(False, "--report", help="Only show how the simulation has done so far"),
+    reset: bool = typer.Option(False, "--reset", help="Delete this simulation and start again"),
+):
+    """Run the autopilot on pretend money against the live market, with realistic fills, and track the result."""
+    import shutil
+
+    from .auto import AutoPilot
+    from .exchange import PaperBroker
+    from .risk import AICostLedger, Executor, Journal, RiskManager
+    from .runner import parse_duration, run_forever
+    from .sim import SimTracker
+
+    base = load_settings()
+    sim_dir = base.state_dir / "sim" / name
+    if reset and sim_dir.is_dir():
+        shutil.rmtree(sim_dir)
+        console.print(f"Simulation '{name}' deleted.")
+    s = replace(base, mode="paper", state_dir=sim_dir, paper_equity=amount)
+    s.ensure_dirs()
+    broker = PaperBroker(s)
+    tracker = SimTracker(s, broker)
+
+    def show_report():
+        rep = tracker.report()
+        if rep:
+            console.print(_metrics_table(rep, f"Simulation '{name}'"))
+        else:
+            console.print(f"Simulation '{name}' has not recorded anything yet.")
+
+    if report:
+        show_report()
+        return
+    started = broker.state.get("start_equity", amount)
+    if started != amount:
+        console.print(f"[yellow]Simulation '{name}' already exists with ${started:,.0f}; continuing it. Use --reset to start over with ${amount:,.0f}.[/yellow]")
+    console.print(f"[bold green]SIMULATION '{name}'[/bold green]: ${started:,.0f} of pretend money on live prices. Coins: {', '.join(s.coins)}")
+    executor = Executor(s, broker, RiskManager(s), Journal(s.state_dir))
+    use_llm = not no_llm
+    if use_llm and not s.llm_api_key:
+        console.print("[yellow]DEEPSEEK_API_KEY is not set: strategies will be picked by the built-in rule, not the AI.[/yellow]")
+        use_llm = False
+
+    def on_event(kind: str, text: str) -> None:
+        if kind in ("tool", "action"):
+            console.log(f"[cyan]{kind}[/cyan] {text[:300]}")
+
+    pilot = AutoPilot(s, executor, use_llm, parse_duration(review_every), parse_duration(research_every), console.log, on_event)
+    ledger = AICostLedger(s)
+
+    def step():
+        results = pilot.tick()
+        acct = executor.account()
+        row = tracker.record(acct, broker.mids())
+        moved = [r for r in results if r["status"] not in ("hold", "noop")]
+        console.log(
+            f"equity ${row['equity']:,.2f} ({(row['equity'] / started - 1) * 100:+.2f}%), net of AI cost ${row['equity'] - started - ledger.total():+,.2f}, "
+            f"buy-and-hold ${row['benchmark']:,.2f}, {len(acct.positions)} position(s), "
+            + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
+        )
+
+    if once:
+        step()
+        show_report()
+    else:
+        run_forever(step, parse_duration(tick), console.log)
+        show_report()
+
+
+@app.command()
+def replay(
+    amount: float = typer.Option(10_000.0, "--amount", "-a", help="Starting balance in USD"),
+    days: float = typer.Option(150.0, "--days", "-d", help="How far back to replay"),
+    interval: str = typer.Option("4h", "--interval", "-i"),
+    repick_days: int = typer.Option(14, "--repick-days", help="How often strategies are re-chosen"),
+    lookback_days: float = typer.Option(150.0, "--lookback-days", help="History used for each research run"),
+):
+    """Replay the rule-based autopilot over past months: research, pick, trade, re-pick, with no hindsight."""
+    from .sim import replay as run_replay
+
+    s = load_settings()
+    console.print(
+        f"Replaying {days:g} days on {interval} candles with ${amount:,.0f}; strategies re-picked every {repick_days} days "
+        "from earlier data only. This takes a few minutes."
+    )
+    out = run_replay(s, amount, days, interval, repick_days, lookback_days, console.log)
+    console.print(_table(pd.DataFrame(out["periods"]), "Periods"))
+    console.print(_metrics_table(out["metrics"], "Replay result (buy hold = equal-weight basket of the coins)"))
+    path = s.reports_dir / f"replay_{interval}_{int(days)}d.csv"
+    pd.DataFrame({"equity": out["equity"], "buy_and_hold": out["benchmark"]}).to_csv(path)
+    console.print(f"Equity curve: {path}")
+    console.print("[yellow]The LLM is not part of a replay: a language model may already know what happened in this period.[/yellow]")
+
+
+@app.command()
+def mcp():
+    """Start the MCP server (stdio) so an AI client such as Claude Code can use the bot."""
+    from .mcp_server import main
+
+    main()
+
+
+@app.command()
+def api(
+    host: str = typer.Option("127.0.0.1", "--host", help="Use 0.0.0.0 to accept remote connections (needs HL_API_TOKEN)"),
+    port: int = typer.Option(8787, "--port"),
+):
+    """Start the HTTP API."""
+    import os
+
+    import uvicorn
+
+    from .api import create_app
+
+    token = os.getenv("HL_API_TOKEN", "").strip()
+    load_settings()  # loads .env
+    token = token or os.getenv("HL_API_TOKEN", "").strip()
+    if host not in ("127.0.0.1", "localhost", "::1") and not token:
+        console.print("[red]Refusing to listen on a public address without HL_API_TOKEN set.[/red]")
+        raise typer.Exit(2)
+    console.print(f"API on http://{host}:{port}  (token {'required, docs pages off' if token else 'not set: localhost only, docs at /docs'})")
+    uvicorn.run(create_app(token=token), host=host, port=port, log_level="warning")
+
+
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: Optional[int] = typer.Option(None, "--port", help="Defaults to $PORT, then 8787"),
+    tick: str = typer.Option("5m", "--tick", envvar="HL_TICK"),
+    review_every: str = typer.Option("4h", "--review-every", envvar="HL_REVIEW_EVERY"),
+    research_every: str = typer.Option("24h", "--research-every", envvar="HL_RESEARCH_EVERY"),
+    no_llm: bool = typer.Option(False, "--no-llm"),
+    live: bool = O_LIVE,
+):
+    """Autopilot and HTTP API in one process, sharing one account. Made for cloud hosts."""
+    import os
+    import threading
+    import time
+
+    import uvicorn
+
+    from .api import create_app
+    from .auto import AutoPilot
+    from .runner import parse_duration
+    from .service import Service
+
+    s = load_settings()
+    token = os.getenv("HL_API_TOKEN", "").strip()
+    if host not in ("127.0.0.1", "localhost", "::1") and not token:
+        console.print("[red]Refusing to listen on a public address without HL_API_TOKEN set.[/red]")
+        raise typer.Exit(2)
+    _banner(s, False)
+    _, executor = _stack(s, False, live)
+    use_llm = not no_llm and bool(s.llm_api_key)
+    if not use_llm:
+        console.print("Strategies are picked by the built-in rule (no LLM key, or --no-llm).")
+    lock = threading.Lock()
+    pilot = AutoPilot(s, executor, use_llm, parse_duration(review_every), parse_duration(research_every), console.log, lock=lock)
+    service = Service(s, executor=executor, runner=pilot.runner, lock=lock)
+    wait = parse_duration(tick)
+
+    def loop():
+        while True:
+            try:
+                results = pilot.tick()  # takes the lock itself, only around account reads and trades
+                with lock:
+                    acct = executor.account()
+                    pnl = executor.pnl_report(acct.equity)
+                moved = [r for r in results if r["status"] not in ("hold", "noop")]
+                console.log(
+                    f"equity ${acct.equity:,.2f}, net PnL after AI cost ${pnl['net_pnl_usd']:+,.2f}, {len(acct.positions)} position(s), "
+                    + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
+                )
+            except Exception as e:  # keep the API up and try again next tick
+                console.log(f"autopilot tick failed ({type(e).__name__}): {e}")
+            time.sleep(wait)
+
+    threading.Thread(target=loop, daemon=True, name="autopilot").start()
+    port = port or int(os.getenv("PORT", "8787"))
+    console.print(f"API on http://{host}:{port} (token {'required' if token else 'not set: localhost only'}); autopilot ticking every {tick}")
+    uvicorn.run(create_app(service, token=token), host=host, port=port, log_level="warning")
 
 
 @app.command()
@@ -623,7 +836,7 @@ def doctor():
             from .exchange import HyperliquidBroker
 
             b = HyperliquidBroker(s)
-            return f"account {b.address[:6]}...{b.address[-4:]} equity ${b.account().equity:,.2f}"
+            return f"account {b.address[:6]}...{b.address[-4:]} ({b.abstraction}) equity ${b.account().equity:,.2f}"
 
         check(f"{s.mode} account", live_check)
     else:

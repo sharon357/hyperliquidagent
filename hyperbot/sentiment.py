@@ -152,3 +152,49 @@ def snapshot(coins: list[str], data: HLData | None = None, news_limit: int = 30)
         "Extremes are often contrarian: extreme greed and crowded funding tend to precede pullbacks."
     )
     return out
+
+
+def search_news(query: str, limit: int = 12) -> list[dict]:
+    """Search recent news across the web for a query (Google News). Untrusted text."""
+    from urllib.parse import quote_plus
+
+    url = f"https://news.google.com/rss/search?q={quote_plus(query[:120])}+when:7d&hl=en-US&gl=US&ceid=US:en"
+    root = ET.fromstring(_request("GET", url, retries=2, timeout=15).content)
+    items = []
+    for item in root.iter("item"):
+        title = clean_text(item.findtext("title") or "", 200)
+        if not title:
+            continue
+        published = ""
+        try:
+            published = parsedate_to_datetime(item.findtext("pubDate") or "").isoformat(timespec="minutes")
+        except (TypeError, ValueError):
+            pass
+        items.append(
+            {
+                "published": published,
+                "source": clean_text(item.findtext("source") or "", 60),
+                "title": title,
+                "keyword_score": lexicon_score(title),
+            }
+        )
+    items.sort(key=lambda x: x["published"], reverse=True)
+    return items[:limit]
+
+
+def trending() -> list[dict]:
+    """What retail is searching for right now (CoinGecko trending). A crowd-attention gauge."""
+    data = _request("GET", "https://api.coingecko.com/api/v3/search/trending", retries=2, timeout=15).json()
+    out = []
+    for c in data.get("coins", [])[:15]:
+        item = c.get("item", {})
+        change = (item.get("data", {}).get("price_change_percentage_24h") or {}).get("usd")
+        out.append(
+            {
+                "symbol": str(item.get("symbol", "")).upper()[:12],
+                "name": clean_text(item.get("name") or "", 40),
+                "market_cap_rank": item.get("market_cap_rank"),
+                "change_24h_pct": round(change, 1) if isinstance(change, (int, float)) else None,
+            }
+        )
+    return out
