@@ -545,6 +545,12 @@ def auto(
         results = pilot.tick()
         acct = executor.account()
         moved = [r for r in results if r["status"] not in ("hold", "noop")]
+        for r in moved:
+            if r["status"] in ("error", "rejected") or r.get("protection_errors"):
+                console.log(
+                    f"[red]{r['coin']} {r['status']}[/red]: "
+                    f"{r.get('error') or r.get('risk_notes') or ''} {r.get('protection_errors') or ''}".strip()
+                )
         console.log(
             f"equity ${acct.equity:,.2f}, {len(acct.positions)} position(s), "
             + (", ".join(f"{r['coin']} {r['target_fraction']:+.2f} {r['status']}" for r in moved) or "no changes")
