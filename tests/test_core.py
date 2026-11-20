@@ -1122,3 +1122,17 @@ def test_profit_target_banks_everything_then_rebuilds(stack, monkeypatch):
     pilot.tick()
     assert len(reviews) == 2
     assert "5% of the account per day" in ex.risk.limits()["owner_profit_target"]
+
+
+def test_deposit_seen_in_the_balance_before_the_ledger_is_not_a_drawdown(tmp_path):
+    s = Settings(state_dir=tmp_path, coins=["BTC"], max_daily_loss_pct=10, max_drawdown_pct=30)
+    rm = RiskManager(s)
+    rm.update(33.0, net_deposits=30.8)
+    rm.update(534.0, net_deposits=30.8)  # the $501 has arrived but the ledger has not reported it yet
+    rm.update(534.0, net_deposits=531.8)  # now it has
+    assert rm.state["high_water_mark"] == pytest.approx(534.0) and not rm.state["halted"]
+    assert rm.daily_pnl_pct(534.0) == pytest.approx(0.0, abs=0.5)
+    rm.update(500.0, net_deposits=531.8)  # a real 6% loss afterwards is still measured correctly
+    assert not rm.state["halted"] and rm.daily_pnl_pct(500.0) == pytest.approx(-6.4, abs=0.2)
+    rm.update(370.0, net_deposits=531.8)
+    assert rm.state["halted"]  # and a real 30% drawdown still halts

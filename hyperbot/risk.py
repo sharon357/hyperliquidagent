@@ -8,6 +8,7 @@ way past them.
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -181,7 +182,20 @@ class RiskManager:
                 moved = net_deposits - self.state["net_deposits"]
                 self.state["net_deposits"] = net_deposits
                 self.state["day_start_equity"] = max(self.state["day_start_equity"] + moved, 0.0)
-                self.state["high_water_mark"] = max(self.state["high_water_mark"] + moved, 0.0)
+                jump = self.state.pop("unexplained_jump", None)
+                if jump and moved > 0 and jump["amount"] >= 0.8 * moved and time.time() - jump["time"] < 900:
+                    # The balance showed this deposit before the ledger did, and the high-water mark
+                    # already rose with it. Shifting it again would count the deposit twice and read
+                    # as a huge drawdown, so rebuild it from where it stood before the money arrived.
+                    self.state["high_water_mark"] = max(jump["hwm_before"] + moved, 0.0)
+                else:
+                    self.state["high_water_mark"] = max(self.state["high_water_mark"] + moved, 0.0)
+            else:
+                last = self.state.get("last_equity")
+                if last and equity - last > 0.05 * last:
+                    # Up more than 5% between two looks with no deposit on the ledger: remember where
+                    # the high-water mark stood, in case this turns out to be a deposit reported late.
+                    self.state["unexplained_jump"] = {"amount": equity - last, "time": time.time(), "hwm_before": self.state["high_water_mark"]}
         today = utc_now().strftime("%Y-%m-%d")
         if not self.state.get("baseline_equity") and equity > 0:
             # Equity when the bot first saw the account: the starting point for profit and loss.
@@ -195,6 +209,7 @@ class RiskManager:
             dd = (1 - equity / hwm) * 100
             if dd >= self.s.max_drawdown_pct:
                 self.halt(f"drawdown {dd:.1f}% from the high-water mark reached the {self.s.max_drawdown_pct}% limit")
+        self.state["last_equity"] = equity
         self._save()
 
     def halt(self, reason: str) -> None:
@@ -335,7 +350,14 @@ class Executor:
 
     def account(self) -> AccountState:
         acct = self.broker.account()
-        self.risk.update(acct.equity, self._deposits())
+        deposits = self._deposits()
+        last = self.risk.state.get("last_equity")
+        if deposits is not None and last and abs(acct.equity - last) > 0.05 * last and hasattr(self.broker, "_deposit_cache"):
+            # A move this size between two looks is more likely money going in or out than trading:
+            # read the ledger again now instead of trusting a figure cached up to a minute ago.
+            self.broker._deposit_cache = None
+            deposits = self._deposits()
+        self.risk.update(acct.equity, deposits)
         return acct
 
     def pnl_report(self, equity: float) -> dict:
