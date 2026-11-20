@@ -6,3 +6,4 @@ __pycache__/
 state/
 data/
 reports/
+.mcp.json

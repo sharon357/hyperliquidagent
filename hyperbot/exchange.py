@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -81,6 +83,11 @@ class Broker:
     def mids(self) -> dict[str, float]:
         raise NotImplementedError
 
+    def fills(self, since_ms: int) -> list[dict]:
+        """The account's own fills since `since_ms`, in the exchange's format (coin, side, px, sz, dir,
+        closedPnl, fee, time). Brokers without an exchange history return nothing."""
+        return []
+
     def market(self, coin: str, delta_units: float, reduce_only: bool = False) -> Fill:
         """Trade `delta_units` (signed) at market."""
         raise NotImplementedError
@@ -102,11 +109,55 @@ class Broker:
         pass
 
 
-class PaperBroker(Broker):
-    """Simulated account. Fills at the live Hyperliquid mid price plus slippage and taker fee.
+def walk_book(levels: list[tuple[float, float]], size: float) -> float | None:
+    """Average price paid to take `size` units from one side of an order book.
 
-    Stops and take-profits are checked whenever the account is read, so they trigger
-    at the next poll rather than at the exact price. Funding is not simulated.
+    If the order is bigger than the visible book, the rest is assumed to fill
+    progressively worse than the last visible level.
+    """
+    if not levels or size <= 0:
+        return None
+    remaining, cost = size, 0.0
+    for px, sz in levels:
+        take = min(remaining, sz)
+        cost += take * px
+        remaining -= take
+        if remaining <= 0:
+            return cost / size
+    first, last = levels[0][0], levels[-1][0]
+    visible = size - remaining
+    # Extrapolate the book's slope: twice the size costs roughly twice the distance.
+    extra = (last - first) * (remaining / max(visible, 1e-12))
+    cost += remaining * (last + extra)
+    return cost / size
+
+
+def sqrt_impact_bps(notional_usd: float, daily_volume_usd: float, daily_vol_pct: float) -> float:
+    """Square-root market-impact law: impact = daily volatility * sqrt(order / daily volume).
+
+    This is the standard empirical estimate of how far an order moves the price
+    beyond what the visible book shows (other traders pulling quotes or trading
+    ahead of the rest of the order).
+    """
+    if notional_usd <= 0 or not daily_volume_usd or daily_volume_usd <= 0:
+        return 0.0
+    return daily_vol_pct * 100 * math.sqrt(notional_usd / daily_volume_usd)
+
+
+class PaperBroker(Broker):
+    """Simulated account trading against the real, live Hyperliquid market.
+
+    A fill is priced in three layers:
+    1. the real order book is walked for the order's size (spread + depth);
+    2. a square-root impact term is added for the market's reaction to the order;
+    3. our own recent trades in the same direction leave a "pressure" that decays
+       over time and makes follow-up orders in that direction more expensive.
+    Funding is charged on open positions at the live rate. Stops and take-profits
+    are checked whenever the account is read, so they trigger at the next poll.
+
+    What it cannot do: change the real price path. Other traders never see these
+    orders, so their longer-term reactions (copying, fading, hunting stops) are
+    not simulated.
     """
 
     name = "paper"
@@ -116,18 +167,100 @@ class PaperBroker(Broker):
         self.data = data or HLData()
         self.path = Path(settings.state_dir) / "paper_account.json"
         self.state = self._load()
+        self._ctx_cache: tuple[float, dict] = (0.0, {})
+        self._vol_cache: dict[str, float] = {}
+
+    def _fresh(self) -> dict:
+        return {
+            "cash": self.s.paper_equity,
+            "start_equity": self.s.paper_equity,
+            "positions": {},
+            "protection": {},
+            "fees_paid": 0.0,
+            "costs": {"fees": 0.0, "spread_and_depth": 0.0, "impact": 0.0, "funding": 0.0},
+            "pressure": {},
+            "trades": 0,
+            "volume_usd": 0.0,
+        }
 
     def _load(self) -> dict:
+        state = self._fresh()
         if self.path.is_file():
-            return json.loads(self.path.read_text(encoding="utf-8"))
-        return {"cash": self.s.paper_equity, "positions": {}, "protection": {}, "fees_paid": 0.0}
+            state.update(json.loads(self.path.read_text(encoding="utf-8")))
+        return state
+
+    def _contexts(self) -> dict:
+        """Live funding and volume per coin, cached for a minute."""
+        stamp, ctxs = self._ctx_cache
+        if time.time() - stamp > 60:
+            ctxs = self.data.asset_contexts()
+            self._ctx_cache = (time.time(), ctxs)
+        return ctxs
+
+    def _execution_price(self, coin: str, delta: float, mid: float) -> tuple[float, float, float]:
+        """(fill price, spread+depth cost, impact cost) for trading `delta` units."""
+        side = 1.0 if delta > 0 else -1.0
+        size = abs(delta)
+        book_px = None
+        try:
+            bids, asks = self.data.book_levels(coin)
+            book_px = walk_book(asks if side > 0 else bids, size)
+            if bids and asks:
+                mid = (bids[0][0] + asks[0][0]) / 2  # measure costs against this same snapshot
+        except Exception:
+            pass  # no book available: fall back to the flat slippage setting
+        if book_px is None:
+            book_px = mid * (1 + side * self.s.slippage_bps / 1e4)
+
+        impact_bps = 0.0
+        try:
+            if coin not in self._vol_cache:
+                self._vol_cache[coin] = self.data.daily_vol_pct(coin)
+            volume = self._contexts()[coin]["volume_24h_usd"]
+            impact_bps = sqrt_impact_bps(size * mid, volume, self._vol_cache[coin]) * self.s.sim_impact
+        except Exception:
+            pass
+
+        # Pressure left by our own earlier trades, decaying with a half-life.
+        now = time.time()
+        prev = self.state["pressure"].get(coin, {"bps": 0.0, "time": now})
+        half_life = max(self.s.sim_impact_halflife_min * 60, 1.0)
+        decayed = prev["bps"] * 0.5 ** ((now - prev["time"]) / half_life)
+        residual_bps = max(0.0, decayed * side)  # only same-direction orders pay it; no rebate the other way
+        self.state["pressure"][coin] = {"bps": decayed + side * impact_bps, "time": now}
+
+        px = book_px * (1 + side * (impact_bps + residual_bps) / 1e4)
+        return px, size * abs(book_px - mid), size * abs(px - book_px)
+
+    def _accrue_funding(self, mids: dict[str, float]) -> None:
+        now = time.time()
+        last = self.state.get("funding_time", now)
+        hours = (now - last) / 3600
+        if not self.state["positions"]:
+            self.state["funding_time"] = now
+            return
+        if "funding_time" in self.state and hours < 5 / 60:
+            return
+        try:
+            ctxs = self._contexts()
+        except Exception:
+            return  # try again on the next poll; the elapsed time keeps accumulating
+        for coin, p in self.state["positions"].items():
+            rate = ctxs.get(coin, {}).get("funding_hourly", 0.0)
+            if rate != rate:  # NaN
+                continue
+            pay = p["size"] * mids.get(coin, p["entry_px"]) * rate * min(hours, 24.0)
+            self.state["cash"] -= pay  # longs pay when funding is positive
+            self.state["costs"]["funding"] += pay
+        self.state["funding_time"] = now
+        self._save()
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self.state, indent=2), encoding="utf-8")
 
     def reset(self) -> None:
-        self.state = {"cash": self.s.paper_equity, "positions": {}, "protection": {}, "fees_paid": 0.0}
+        self.state = self._fresh()
         self._save()
 
     def mids(self) -> dict[str, float]:
@@ -136,9 +269,14 @@ class PaperBroker(Broker):
     def _fill(self, coin: str, delta: float, mid: float) -> Fill:
         if delta == 0:
             return Fill(False, coin, error="zero size")
-        slip = self.s.slippage_bps / 1e4
-        px = mid * (1 + slip if delta > 0 else 1 - slip)
+        px, depth_cost, impact_cost = self._execution_price(coin, delta, mid)
         fee = abs(delta) * px * self.s.taker_fee
+        costs = self.state["costs"]
+        costs["fees"] += fee
+        costs["spread_and_depth"] += depth_cost
+        costs["impact"] += impact_cost
+        self.state["trades"] += 1
+        self.state["volume_usd"] += abs(delta) * px
         pos = self.state["positions"].get(coin, {"size": 0.0, "entry_px": 0.0})
         size, entry = pos["size"], pos["entry_px"]
         new_size = size + delta
@@ -177,6 +315,7 @@ class PaperBroker(Broker):
     def account(self) -> AccountState:
         mids = self.mids()
         self._check_protection(mids)
+        self._accrue_funding(mids)
         positions = {}
         unrealized = 0.0
         for coin, p in self.state["positions"].items():
@@ -243,10 +382,62 @@ class HyperliquidBroker(Broker):
         universe = self.info.meta()["universe"]
         self._sz_decimals = {a["name"]: int(a["szDecimals"]) for a in universe}
         self._max_leverage = {a["name"]: int(a.get("maxLeverage", 1)) for a in universe}
-        self._leverage_set: set[str] = set()
+        self._leverage_set: set[tuple[str, int]] = set()
+        # Unified accounts (and portfolio margin) keep their USDC on the spot side and
+        # use it directly as perp collateral, so the perp-only summary reads zero.
+        try:
+            self.abstraction = str(self.info.post("/info", {"type": "userAbstraction", "user": self.address}))
+        except Exception:
+            self.abstraction = "unknown"
+        self.unified = self.abstraction in ("unifiedAccount", "portfolioMargin")
 
     def mids(self) -> dict[str, float]:
         return {k: float(v) for k, v in self.info.all_mids().items()}
+
+    def fills(self, since_ms: int) -> list[dict]:
+        out, start = [], int(since_ms)
+        for _ in range(10):  # the exchange returns at most 2,000 fills per call
+            batch = self.info.post("/info", {"type": "userFillsByTime", "user": self.address, "startTime": start, "aggregateByTime": True})
+            if not batch:
+                break
+            out += batch
+            if len(batch) < 2000:
+                break
+            start = max(int(f["time"]) for f in batch) + 1
+        return out
+
+    def net_deposits(self) -> float | None:
+        """USDC paid into the account minus USDC taken out, from the exchange's ledger (cached for a minute)."""
+        cached = getattr(self, "_deposit_cache", None)
+        if cached and time.time() - cached[0] < 60:
+            return cached[1]
+        try:
+            ledger = self.info.post("/info", {"type": "userNonFundingLedgerUpdates", "user": self.address, "startTime": 0})
+        except Exception:
+            return cached[1] if cached else None
+        me = self.address.lower()
+        total = 0.0
+        for entry in ledger:
+            d = entry.get("delta", {})
+            kind = d.get("type")
+            if kind == "deposit":
+                total += float(d.get("usdc", 0))
+            elif kind == "withdraw":
+                total -= float(d.get("usdc", 0)) + float(d.get("fee", 0))
+            elif kind in ("send", "internalTransfer", "spotTransfer"):
+                if d.get("token", "USDC") != "USDC":
+                    continue
+                amount = float(d.get("amount") or d.get("usdc") or 0)
+                total += amount if str(d.get("destination", "")).lower() == me else -amount
+        self._deposit_cache = (time.time(), total)
+        return total
+
+    def _spot_usdc(self) -> tuple[float, float]:
+        """(total, on hold) USDC on the spot side."""
+        for b in self.info.spot_user_state(self.address).get("balances", []):
+            if b.get("coin") == "USDC":
+                return float(b.get("total", 0)), float(b.get("hold", 0))
+        return 0.0, 0.0
 
     def account(self) -> AccountState:
         st = self.info.user_state(self.address)
@@ -313,11 +504,11 @@ class HyperliquidBroker(Broker):
         return Fill(True, coin, sign * size, notional / size, error="; ".join(errors))
 
     def set_leverage(self, coin: str, leverage: int) -> None:
-        if coin in self._leverage_set:
-            return
         lev = max(1, min(int(leverage), self._max_leverage.get(coin, 1)))
+        if (coin, lev) in self._leverage_set:
+            return  # already set to this value; re-sent only when the limit changes
         self.exchange.update_leverage(lev, coin, is_cross=True)
-        self._leverage_set.add(coin)
+        self._leverage_set = {x for x in self._leverage_set if x[0] != coin} | {(coin, lev)}
 
     def market(self, coin: str, delta_units: float, reduce_only: bool = False) -> Fill:
         sz = self._round_size(coin, delta_units)

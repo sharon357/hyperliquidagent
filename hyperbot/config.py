@@ -37,6 +37,11 @@ class Settings:
     private_key: str = field(default="", repr=False)
     account_address: str = ""
     coins: list[str] = field(default_factory=lambda: ["BTC", "ETH", "SOL"])
+    core_coins: list[str] = field(default_factory=list)  # the configured list; `coins` may grow in auto mode
+    universe_mode: str = "fixed"  # fixed = only HL_COINS; auto = also scan the exchange for other liquid perps
+    universe_extra: int = 5  # how many scanned coins to research besides the core ones
+    min_volume_usd: float = 5_000_000.0  # a perp needs this much 24h volume to be tradable
+    max_alt_position_pct: float = 150.0  # per-coin cap (% of equity) for coins outside the core list
     confirm_mainnet: bool = False
 
     # --- folders
@@ -49,6 +54,8 @@ class Settings:
     slippage_bps: float = 2.0
     live_slippage: float = 0.01  # max slippage tolerated on live market orders
     paper_equity: float = 10_000.0
+    sim_impact: float = 1.0  # multiplier on the simulated market-impact estimate (0 = off)
+    sim_impact_halflife_min: float = 30.0  # how fast our own price pressure fades
 
     # --- hard risk limits (enforced in code, the agent cannot change them)
     max_leverage: float = 3.0  # gross exposure / equity
@@ -60,6 +67,18 @@ class Settings:
     default_stop_loss_pct: float = 3.0
     max_stop_loss_pct: float = 10.0
     rebalance_band: float = 0.10  # ignore resizes smaller than 10 % of the position
+    require_stop: bool = True  # every position must carry a stop-loss
+    bank_fraction: float = 0.5  # share of every position closed when the profit target is hit (1 = close everything)
+    day_intervals: list[str] = field(default_factory=list)  # candle sizes that make up the day-trading sleeve, e.g. ['15m']
+    day_target_pct: float = 0.0  # the day sleeve stops for the day once it has made this many percent of the account (0 = no target)
+    day_stop_pct: float = 0.0  # ... or lost this many (0 = no daily stop)
+    profit_target_pct: float = 0.0  # owner's goal in percent of the account: close everything each time this much is gained since the last bank (0 = off)
+    stop_cooldown_hours: float = 4.0  # after a stop-out, no re-entry on the same side of that coin for this long, whatever the playbook says (0 = off)
+    review_move_pct: float = 3.0  # extra manager review when profit or loss moves this many percent of equity since the last one (0 = off)
+    max_trail_pct: float = 0.0  # owner's cap on the trailing and break-even distance, in percent; trades may be tighter, never wider or off (0 = no cap)
+    default_trail_mult: float = 0.0  # trailing used when a trade does not set its own: this many times its stop distance (0 = none)
+    ai_sets_limits: bool = False  # let the AI manager change the risk limits itself, inside fixed outer bounds
+    exposure_multiplier: float = 1.0  # autopilot only: scales every playbook position (still capped by max_leverage)
 
     # --- LLM agent (any OpenAI-compatible API; DeepSeek by default)
     llm_api_key: str = field(default="", repr=False)
@@ -67,6 +86,11 @@ class Settings:
     agent_model: str = "deepseek-v4-pro"
     agent_effort: str = "high"  # DeepSeek thinking effort: low | high | max ("" = do not send)
     agent_max_steps: int = 25
+    agent_max_tokens: int = 32000  # per model call, reasoning included
+    # LLM prices in USD per 1M tokens (defaults: deepseek-v4-pro peak rates; off-peak is half)
+    llm_price_input: float = 1.32
+    llm_price_input_cached: float = 0.044
+    llm_price_output: float = 3.96
 
     # --- autopilot research
     research_days: float = 180.0
@@ -101,19 +125,31 @@ def load_settings(env_file: str | None = None) -> Settings:
         raise ValueError(f"HL_MODE must be one of {MODES}, got {mode!r}")
     coins = [c.strip().upper() for c in os.getenv("HL_COINS", "BTC,ETH,SOL").split(",") if c.strip()]
     d = Settings()
+    universe_mode = os.getenv("HL_UNIVERSE", d.universe_mode).strip().lower() or d.universe_mode
+    if universe_mode not in ("fixed", "auto"):
+        raise ValueError("HL_UNIVERSE must be 'fixed' or 'auto'")
+    _day = [i.strip() for i in os.getenv("HL_DAY_INTERVALS", "").split(",") if i.strip()]
     s = Settings(
+        core_coins=list(coins),
+        universe_mode=universe_mode,
+        universe_extra=_int("HL_UNIVERSE_SIZE", d.universe_extra),
+        min_volume_usd=_float("HL_MIN_VOLUME_USD", d.min_volume_usd),
+        max_alt_position_pct=_float("HL_MAX_ALT_POSITION_PCT", d.max_alt_position_pct),
         mode=mode,
         private_key=_read_private_key(),
         account_address=os.getenv("HL_ACCOUNT_ADDRESS", "").strip(),
         coins=coins,
         confirm_mainnet=_bool("HL_CONFIRM_MAINNET", False),
-        state_dir=Path(os.getenv("HL_STATE_DIR", "state")),
+        # Real accounts keep their own risk state and journal, apart from the paper account's.
+        state_dir=Path(os.getenv("HL_STATE_DIR", "state")) / ("" if mode == "paper" else mode),
         data_dir=Path(os.getenv("HL_DATA_DIR", "data")),
         reports_dir=Path(os.getenv("HL_REPORTS_DIR", "reports")),
         taker_fee=_float("HL_TAKER_FEE", d.taker_fee),
         slippage_bps=_float("HL_SLIPPAGE_BPS", d.slippage_bps),
         live_slippage=_float("HL_LIVE_SLIPPAGE", d.live_slippage),
         paper_equity=_float("HL_PAPER_EQUITY", d.paper_equity),
+        sim_impact=_float("HL_SIM_IMPACT", d.sim_impact),
+        sim_impact_halflife_min=_float("HL_SIM_IMPACT_HALFLIFE_MIN", d.sim_impact_halflife_min),
         max_leverage=_float("HL_MAX_LEVERAGE", d.max_leverage),
         max_position_pct=_float("HL_MAX_POSITION_PCT", d.max_position_pct),
         max_daily_loss_pct=_float("HL_MAX_DAILY_LOSS_PCT", d.max_daily_loss_pct),
@@ -123,13 +159,30 @@ def load_settings(env_file: str | None = None) -> Settings:
         default_stop_loss_pct=_float("HL_DEFAULT_STOP_LOSS_PCT", d.default_stop_loss_pct),
         max_stop_loss_pct=_float("HL_MAX_STOP_LOSS_PCT", d.max_stop_loss_pct),
         rebalance_band=_float("HL_REBALANCE_BAND", d.rebalance_band),
+        require_stop=_bool("HL_REQUIRE_STOP", d.require_stop),
+        default_trail_mult=_float("HL_DEFAULT_TRAIL_MULT", d.default_trail_mult),
+        max_trail_pct=_float("HL_MAX_TRAIL_PCT", d.max_trail_pct),
+        review_move_pct=_float("HL_REVIEW_MOVE_PCT", d.review_move_pct),
+        stop_cooldown_hours=max(_float("HL_STOP_COOLDOWN_HOURS", d.stop_cooldown_hours), 0.0),
+        profit_target_pct=_float("HL_PROFIT_TARGET_PCT", d.profit_target_pct),
+        bank_fraction=min(max(_float("HL_BANK_FRACTION", d.bank_fraction), 0.1), 1.0),
+        day_intervals=_day,
+        day_target_pct=_float("HL_DAY_TARGET_PCT", d.day_target_pct),
+        day_stop_pct=_float("HL_DAY_STOP_PCT", d.day_stop_pct),
+        ai_sets_limits=_bool("HL_AI_SETS_LIMITS", d.ai_sets_limits),
+        exposure_multiplier=_float("HL_EXPOSURE_MULTIPLIER", d.exposure_multiplier),
         llm_api_key=(os.getenv("HL_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip(),
         llm_base_url=os.getenv("HL_LLM_BASE_URL", d.llm_base_url).strip() or d.llm_base_url,
         agent_model=os.getenv("HL_AGENT_MODEL", d.agent_model).strip() or d.agent_model,
         agent_effort=os.getenv("HL_AGENT_EFFORT", d.agent_effort).strip(),
         agent_max_steps=_int("HL_AGENT_MAX_STEPS", d.agent_max_steps),
+        agent_max_tokens=_int("HL_AGENT_MAX_TOKENS", d.agent_max_tokens),
+        llm_price_input=_float("HL_LLM_PRICE_INPUT", d.llm_price_input),
+        llm_price_input_cached=_float("HL_LLM_PRICE_INPUT_CACHED", d.llm_price_input_cached),
+        llm_price_output=_float("HL_LLM_PRICE_OUTPUT", d.llm_price_output),
         research_days=_float("HL_RESEARCH_DAYS", d.research_days),
-        research_intervals=[i.strip() for i in os.getenv("HL_RESEARCH_INTERVALS", "1h,4h").split(",") if i.strip()],
+        # the day sleeve's candle sizes are researched too
+        research_intervals=list(dict.fromkeys([i.strip() for i in os.getenv("HL_RESEARCH_INTERVALS", "1h,4h").split(",") if i.strip()] + _day)),
     )
     s.ensure_dirs()
     return s

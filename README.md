@@ -3,7 +3,7 @@
 A command-line trading bot for Hyperliquid perpetuals:
 
 - **Backtesting** with fees, slippage, funding, leverage, stops and liquidation, plus parameter search and walk-forward testing.
-- **Ten strategies** (trend, momentum, breakout, mean reversion, funding carry, regime switching, ensemble).
+- **Twenty-two strategies** (trend, momentum, breakout, mean reversion, funding carry, regime switching, ensemble, volatility-targeted forecast blends, a half-life-gated reversion rule, a self-checking trend rule, and eight rules taken from published research write-ups). Seventeen are researched and traded by the autopilot; five lost in testing and are kept for manual backtests only.
 - **An LLM agent** (DeepSeek by default) that reads quant signals, recent strategy performance and market sentiment, then manages positions.
 - **A risk engine in plain code** that every order passes through. The agent cannot exceed it.
 - **Three modes**: `paper` (simulated fills at real prices, the default), `testnet`, `mainnet`.
@@ -82,6 +82,29 @@ hyperbot auto       # research, pick strategies, trade, repeat
 
 Options: `--tick 5m`, `--review-every 4h`, `--research-every 24h`, `--no-llm`, `--once`, `--dry-run`.
 
+### Simulation
+
+See how the automation would do with a given amount before risking any:
+
+```bash
+hyperbot simulate --amount 5000          # autopilot on pretend money, live prices, runs until stopped
+hyperbot simulate --report               # how it has done so far, with a cost breakdown
+hyperbot simulate --amount 50000 --name big   # a second simulation alongside the first
+hyperbot replay --amount 10000 --days 150     # replay the rule-based autopilot over past months
+```
+
+`simulate` prices each fill in three layers, so your own trading affects your results:
+
+1. **The real order book** is walked for the order's size, so you pay the spread and eat into depth.
+2. **Market reaction**: a square-root impact estimate (daily volatility × √(order size ÷ daily volume)) is added for liquidity that moves away from an order.
+3. **Your own pressure**: each trade leaves an impact that decays (30-minute half-life by default), making follow-up orders in the same direction more expensive.
+
+Funding is charged at the live rate. `HL_SIM_IMPACT` scales the impact estimate (0 off, 2 pessimistic).
+
+What a simulation cannot do is change the real price path: other traders never see these orders, so longer-term reactions such as copying, fading or stop-hunting are not modelled. For a few thousand dollars in BTC, ETH or SOL the modelled impact is a fraction of a basis point; it becomes material with large size or thin coins.
+
+`replay` re-chooses strategies every 14 days using only earlier data, then trades them until the next re-pick. The LLM is left out of replays because a language model may already know what happened in the period.
+
 ### The discretionary agent
 
 A second way to use the LLM: instead of choosing strategies, it sets positions directly each cycle.
@@ -106,7 +129,116 @@ Any OpenAI-compatible API works: change `HL_LLM_BASE_URL`, `HL_AGENT_MODEL` and 
 3. Set `HL_MODE=testnet` first and run for a while. The live order path has only been checked read-only here, so testnet is where you confirm fills, stops and leverage behave as expected.
 4. For real money set `HL_MODE=mainnet` and pass `--live` (or `HL_CONFIRM_MAINNET=yes` for Docker).
 
+Unified accounts (USDC held on the spot side and used directly as perp collateral) are detected automatically. Testnet and mainnet keep their risk state and journal in `state/testnet` and `state/mainnet`, apart from the paper account.
+
+Hyperliquid's minimum order is $10. On a very small account, trade one coin (`HL_COINS=BTC`) and raise `HL_MAX_LEVERAGE`, `HL_MAX_POSITION_PCT` and `HL_EXPOSURE_MULTIPLIER` so a position can reach that size; otherwise orders are skipped as too small.
+
 The private key is read by the bot process only. The LLM never sees it: the model can only call the tools in `hyperbot/agent.py`.
+
+## Use it from Claude Code (MCP) or over HTTP
+
+```bash
+claude mcp add hyperbot -- /absolute/path/to/.venv/bin/hyperbot mcp   # Windows: .venv\Scripts\hyperbot.exe
+```
+
+Run that from the project folder so the server finds `.env` and `state/`. Then prompt Claude Code in plain language, for example "check my hyperbot account and the BTC signals on 4h and 1d, and open a small long if they agree". It gets tools for the account, market, signals, backtests, research, sentiment, trading, the playbook and the kill switch. Trades still pass through the risk limits, and on mainnet they are dry runs unless `HL_CONFIRM_MAINNET=yes`.
+
+```bash
+hyperbot api                      # http://127.0.0.1:8787, docs at /docs
+curl localhost:8787/v1/account
+curl -X POST localhost:8787/v1/set_target -H 'content-type: application/json'      -d '{"coin":"BTC","target_usd":500,"stop_loss_pct":3}'
+```
+
+Set `HL_API_TOKEN` to require `Authorization: Bearer <token>`; the API refuses to listen on a public address without it. `llms.txt` describes the tools and rules for AI agents.
+
+## Trading the whole exchange
+
+With `HL_UNIVERSE=auto` the bot is not limited to `HL_COINS`. Those become the core list, and on each research run it also scans every Hyperliquid perp, keeps the ones with at least `HL_MIN_VOLUME_USD` of 24h volume, and researches the biggest movers and most traded among them (`HL_UNIVERSE_SIZE` extra coins). The AI manager can go further:
+
+- `scan_market` shows every liquid perp with its 24h move, volume, open interest and funding.
+- `research_coin` runs the walk-forward research on any other liquid perp and makes it tradable.
+- `search_news` searches recent web news for any query, and `get_trending` shows what retail is chasing.
+- Each allocation can have a take-profit, and the manager can close a coin and re-enter later.
+
+Coins outside the core list get a tighter per-coin cap (`HL_MAX_ALT_POSITION_PCT`), because smaller perps gap more and have thinner books. A position in a coin that drops out of the universe is closed.
+
+The manager's instructions set an explicit goal: maximise long-run account growth aggressively, through well-reasoned concentrated bets, without bets that could end the account. How aggressive it can be is bounded by the limits in `.env`.
+
+## Profit taking, trailing and automatic reviews
+
+These are owner settings; the AI works inside them.
+
+| Setting | What it does |
+|---|---|
+| `HL_PROFIT_TARGET_PCT` | Each time the account has gained this many percent since the last bank, the bot takes profit and calls the AI to redeploy. The AI is told this is the daily goal. 0 = off |
+| `HL_BANK_FRACTION` | Share of every position closed at the target (default 0.5). The stop on what is left moves to break-even if the position is in profit. 1 = close everything |
+| `HL_DEFAULT_TRAIL_MULT` | Trailing stop used when a trade does not set its own, as a multiple of its stop distance. 0 = none |
+| `HL_MAX_TRAIL_PCT` | Cap on the trailing and break-even distance. Trades may be tighter, never wider or off. 0 = no cap |
+| `HL_REVIEW_MOVE_PCT` | Extra AI review when profit or loss has moved this many percent of equity since the last review (default 3) |
+| `HL_REVIEW_EVERY` | Scheduled AI review interval for `hyperbot serve` |
+| `HL_STOP_COOLDOWN_HOURS` | After a stop-out at a loss, that side of the coin stays shut this long, even if the AI writes a new playbook (default 4, 0 = off). Exits in profit do not count |
+
+The AI is also called at once when a stop, take-profit, trailing stop or time limit closes a position, at most once per half hour. A stop on an open position only ever tightens.
+
+Before each playbook the AI reads `get_track_record`: every closed trade rebuilt from the exchange's own fills, after fees, tagged with the strategy that was on that coin when it opened and totalled per strategy. The scorecard says what worked in a backtest; this says what worked live.
+
+The runner computes each live signal on the same history research used (`HL_RESEARCH_DAYS`), so the rule that trades is the rule that was scored. A test checks every researched strategy for this.
+
+## Day-trading sleeve
+
+Set `HL_DAY_INTERVALS=15m` to split the book in two. Allocations on that candle size are the day-trading sleeve; everything else is the swing sleeve. The bot keeps a separate running result for the day sleeve and switches it off until the next UTC day once it has made `HL_DAY_TARGET_PCT` percent of the account or lost `HL_DAY_STOP_PCT` percent. Because the exchange nets every strategy on a coin into one position, the sleeve's result is tracked on paper from its exposure and price changes, with fees charged on each change.
+
+On the sleeve's candles only seven strategies are researched (`funding_carry`, `carry_trend`, `rsi_reversion`, `tsmom`, `vol_breakout`, `nday_high`, `trend_carry`). In a walk-forward test on eight coins the others lost on almost every coin after costs, because they trade too often for their edge.
+
+## Strategies from published research
+
+Eight rules were added from Quantpedia, Quant Memo, the awesome-systematic-trading collection and QuantifiedTrader, then walk-forward tested on eight coins at 15m, 1h and 4h with costs (November 2026):
+
+| Strategy | Idea | Result |
+|---|---|---|
+| `vol_breakout` | Close beyond the N-day range by a fraction of a day's range; trailing exit | Best on all three timeframes, but from about six trades per coin in a falling market |
+| `nday_high` | Long after a close at an N-day high, short after an N-day low | Mildly positive at 1h |
+| `rsi2_pullback` | Buy a very oversold 2-period RSI in an uptrend, and the mirror image | Mildly positive at 4h |
+| `session_window`, `opening_range`, `mtf_macd`, `atr_bands`, `ibs_reversion` | Time-of-day, opening-range, multi-timeframe MACD and two mean-reversion rules | Lost on nearly every coin at every timeframe; not researched or traded by the autopilot |
+
+## Strategies from the best Hyperliquid wallets
+
+Forty leaderboard accounts chosen for consistency (up weeks, Sharpe, drawdown), not size, were studied from their public fills in November 2026. Their recurring behaviour was turned into three rules and walk-forward tested with costs and funding on 8 coins at 15m, 1h and 4h, and on 1,000 daily candles across 17 coins:
+
+| Strategy | Copied from | Result |
+|---|---|---|
+| `trend_carry` | Books that stay short falling coins while longs pay them funding, adding into rallies | Strong at 15m (7 of 8 coins), flat to negative at 1h and 4h, middling over 1,000 days with a low overfitting score. Researched; the scorecard decides where it is used |
+| `fade_extreme` | Swing traders fading 24h moves of 3% or more and adding to winners | Positive at 4h in the last half-year only; lost over 1,000 days (5 of 17 coins up). Not researched |
+| `session_breakout` | Day traders entering US-session breaks of the 24h range | Break-even at 15m, lost at 1h. Not researched |
+
+The most profitable day traders hold for seconds to minutes. That edge needs sub-second execution and maker fees, and cannot be copied by a bot that decides every five minutes.
+
+`HL_MAX_UNIVERSE` sets how many coins are researched at once (default 12). Research runs in a background thread, so open positions keep being managed while it runs.
+
+## How strategies are judged and sized
+
+The research step and the AI's instructions apply standard results from the systematic-trading literature:
+
+- **Luck adjustment.** Each scorecard row gets `psr` (the chance its true Sharpe ratio is above zero, given how short and lumpy the record is) and `dsr` (the same after allowing for how many candidates were tested). With a few months of data `dsr` is low for almost everything, which is the honest state of the evidence.
+- **Overfitting probability.** Each row also gets `pbo`: the parameter search is repeated on every half of the history and the winner is checked on the other half. `pbo` is how often that winner lands in the bottom half on unseen data. At 0.5 or more, picking the best backtest was no better than chance, and the fallback rule rejects the row.
+- **Embargo.** Walk-forward tests leave a gap between the data parameters are chosen on and the data they are tested on.
+- **Three exits per trade.** Stop, take-profit and a time limit (`max_hold_hours`, or `max_hold_bars` in backtests).
+- **Correlation-aware weights.** Picks are weighted by hierarchical risk parity on their out-of-sample returns, so several look-alike bets share one bet's worth of risk.
+- **Risk-based weights.** The fallback rule requires `psr` of at least 0.75, weights picks inversely to their volatility, shrinks total exposure by average confidence, and caps each weight at half its Kelly leverage.
+- **Forecast strategies.** `forecast_trend` and `carry_trend` blend several signals into one conviction score and size the position to a volatility target. `ou_reversion` only fades moves when the estimated half-life of deviations is short. `meta_trend` only bets while the trend rule itself has recently been making money.
+- **Context for AI clients.** The same principles are in the autopilot manager's prompt and in `.claude/skills/quant-principles/SKILL.md`, which Claude Code loads when working in this folder.
+
+These are ideas implemented from scratch; no book text is included.
+
+## Net profit after AI cost
+
+Every LLM call's tokens are priced and added to a running bill, and profit is reported after subtracting it:
+
+- `hyperbot status` shows trading PnL, AI cost and net PnL since the bot first saw the account.
+- `hyperbot simulate --report` shows the same for a simulation, plus trading costs.
+- The `account` tool (MCP, API and the agent itself) includes the same `pnl` block.
+
+Trading PnL already includes fees, slippage and funding. Prices default to `deepseek-v4-pro` peak rates ($1.32 input, $0.044 cached input, $3.96 output per million tokens; off-peak is half). Change `HL_LLM_PRICE_*` in `.env` if you use another model. Runs with `--no-llm` cost nothing. Tokens Claude Code spends when it trades through the MCP server are not counted, since the bot cannot see them.
 
 ## Risk limits
 
@@ -121,6 +253,7 @@ Set in `.env`, enforced in `hyperbot/risk.py` for the agent, the strategy runner
 | `HL_MAX_DRAWDOWN_PCT` | 20 | Past this, trading halts until `hyperbot resume` |
 | `HL_MAX_TRADES_PER_DAY` | 20 | Cap on position-increasing trades |
 | `HL_DEFAULT_STOP_LOSS_PCT` / `HL_MAX_STOP_LOSS_PCT` | 3 / 10 | Every position gets a stop |
+| `HL_AI_SETS_LIMITS` | no | If yes, the AI manager may change these limits inside fixed outer bounds (leverage up to 20x) |
 
 Orders that reduce risk are always allowed. Requests above a cap are shrunk to fit.
 
@@ -136,10 +269,24 @@ docker compose down
 
 State, cached data and reports are kept in `./state`, `./data` and `./reports` on the host. On a cloud VM, copy the folder, install Docker and run the same commands.
 
+## Railway (or any host that builds a Dockerfile)
+
+The image's default command is `hyperbot serve`: the autopilot and the HTTP API in one process, sharing one account, listening on `$PORT`.
+
+```bash
+railway init --name hyperliquidagent
+railway add --service hyperbot --variables "HL_MODE=paper" --variables "HL_API_TOKEN=<long random string>"
+railway volume add --mount-path /app/state      # Git Bash: prefix with MSYS_NO_PATHCONV=1
+railway up --detach
+railway domain
+```
+
+Add `DEEPSEEK_API_KEY` (and, for live trading, `HL_PRIVATE_KEY`, `HL_ACCOUNT_ADDRESS`, `HL_MODE`, `HL_CONFIRM_MAINNET`) with `railway variables --set "NAME=value"`; the service restarts with them. The volume keeps the account, journal and playbook across deploys. `serve` refuses to start on a public address without `HL_API_TOKEN`.
+
 ## Known limits
 
 - Backtests fill at the next bar's open with fixed slippage. They ignore order-book depth, partial fills and latency.
-- Paper mode checks stops only when the bot polls, and does not charge funding.
+- Paper mode checks stops only when the bot polls.
 - News sentiment is a keyword count plus the model's reading of headlines. Headlines are untrusted text; the risk limits are the real protection against a manipulated feed.
 - The risk engine sees only this bot's account. If you trade the same account by hand, its counters will still apply.
 
@@ -153,6 +300,9 @@ hyperbot/
   exchange.py    paper and live brokers         risk.py        limits, executor, journal
   agent.py       LLM agent and its tools        runner.py      loops and the strategy runner
   auto.py        autopilot: research, playbook, portfolio execution
+  stats.py       probabilistic and deflated Sharpe, Kelly
   report.py      HTML reports                   cli.py         commands
+  sim.py         simulation tracker and replay  service.py     operations behind the API and MCP server
+  api.py         HTTP API                       mcp_server.py  MCP server
 tests/           pytest suite (python -m pytest)
 ```

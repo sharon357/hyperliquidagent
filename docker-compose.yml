@@ -20,3 +20,17 @@ services:
       - ./state:/app/state
       - ./data:/app/data
       - ./reports:/app/reports
+
+  # HTTP API. Set HL_API_TOKEN in .env, then: docker compose --profile api up -d api
+  api:
+    profiles: ["api"]
+    build: .
+    env_file: .env
+    command: ["api", "--host", "0.0.0.0", "--port", "8787"]
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+    volumes:
+      - ./state:/app/state
+      - ./data:/app/data
+      - ./reports:/app/reports

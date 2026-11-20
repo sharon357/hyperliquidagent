@@ -65,6 +65,37 @@ def test_strategy_signals_in_range_and_causal(name):
     assert np.allclose(part.to_numpy(), full.iloc[:cut].to_numpy(), equal_nan=True)
 
 
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_live_window_matches_research_signal(name):
+    """Live trading recomputes each signal on a trailing window; it must agree with the signal research scored.
+
+    A window shorter than a rule's lookback silently turns it off (a 20-day breakout on 15m candles needs
+    1,920 bars), and path-dependent rules drift when they start too late. Checked on 15m candles, the
+    fastest interval the bot trades, with the window as a share of the history the way the runner loads it.
+    """
+    if not REGISTRY[name].research:
+        pytest.skip("not researched, so make_playbook never lets it trade")
+    df = make_df(n=5000, seed=3)
+    df.index = pd.date_range("2025-01-01", periods=len(df), freq="15min", tz="UTC")
+    strat = get_strategy(name)
+    full = strat.signal(df)
+    win = int(len(df) * 0.7)
+    ends = np.linspace(win + 50, len(df), 25).astype(int)
+    agree = [np.sign(strat.signal(df.iloc[e - win:e]).iloc[-1]) == np.sign(full.iloc[e - 1]) for e in ends]
+    assert np.mean(agree) >= 0.96, f"{name}: live-window signal agrees with research only {np.mean(agree):.0%} of the time"
+
+
+def test_runner_loads_research_history(tmp_path, monkeypatch):
+    """The runner must give each strategy at least the history research used, not a fixed 800 bars."""
+    from hyperbot import auto
+
+    seen = []
+    monkeypatch.setattr(auto, "load_history", lambda coin, interval, days, d: seen.append(days) or make_df())
+    s = Settings(data_dir=tmp_path, state_dir=tmp_path, research_days=180.0)
+    auto.PortfolioRunner(s, None).targets({"allocations": [{"coin": "BTC", "interval": "15m", "strategy": "vol_breakout", "params": {}, "weight": 1.0, "stop_loss_pct": 3.0}]})
+    assert seen and seen[0] >= 180.0
+
+
 def test_buy_hold_matches_price_without_costs():
     df = make_df()
     df["funding"] = 0.0
@@ -152,7 +183,10 @@ def test_grid_search_and_walk_forward_run():
 def test_quant_snapshot_is_json_serialisable():
     snap = quant_snapshot(make_df(n=700))
     json.dumps(snap)
-    assert set(snap["strategy_signals"]) == set(REGISTRY) - {"buy_hold"}
+    from hyperbot.strategies import tradable_strategies
+
+    assert set(snap["strategy_signals"]) == set(tradable_strategies())
+    assert "opening_range" in REGISTRY and "opening_range" not in tradable_strategies()  # kept for backtests only
 
 
 # ------------------------------------------------------------------ risk + execution
@@ -372,6 +406,84 @@ def test_portfolio_runner_follows_signals_and_blocks_after_stop(stack, monkeypat
     assert not broker.account().positions
 
 
+def test_stop_out_cooldown_survives_a_new_playbook(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    pb = {"risk_scale": 0.5, "allocations": [{"coin": "BTC", "interval": "1h", "strategy": "x", "params": {}, "weight": 0.8, "stop_loss_pct": 2.0}]}
+    runner = auto.PortfolioRunner(s, ex)
+    runner.step(pb)
+    data.prices["BTC"] = 97.0  # stopped out of the long
+    runner.step(pb)
+    assert "BTC" not in broker.account().positions
+    assert runner.cooling("BTC") == 1
+
+    runner.state["blocked"].clear()  # what writing a new playbook does
+    assert runner.step(pb)[0]["status"] == "noop"  # the cooldown still holds the long side shut
+    assert "BTC" not in broker.account().positions
+
+    runner.state["cooldown"]["BTC"]["until"] = 0  # cooldown over
+    assert runner.step(pb)[0]["status"] == "executed"
+    assert broker.account().positions["BTC"].size > 0
+
+
+def test_stop_out_cooldown_can_be_turned_off(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.stop_cooldown_hours = 0.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    pb = {"risk_scale": 0.5, "allocations": [{"coin": "BTC", "interval": "1h", "strategy": "x", "params": {}, "weight": 0.8, "stop_loss_pct": 2.0}]}
+    runner = auto.PortfolioRunner(s, ex)
+    runner.step(pb)
+    data.prices["BTC"] = 97.0
+    runner.step(pb)
+    runner.state["blocked"].clear()
+    assert runner.step(pb)[0]["status"] == "executed"  # old behaviour: a new playbook re-enters at once
+
+
+def test_track_record_rebuilds_trades_from_fills_and_tags_strategies():
+    from hyperbot import auto
+
+    t0 = 1_763_600_000_000  # ms
+    iso = lambda ms: auto.datetime.fromtimestamp(ms / 1000, auto.timezone.utc).isoformat()
+    playbooks = [
+        {"time": iso(t0 - 60_000), "allocations": [{"coin": "BTC", "interval": "4h", "strategy": "ema_cross"}, {"coin": "ETH", "interval": "15m", "strategy": "carry_trend"}]},
+    ]
+    f = lambda coin, side, sz, pnl, fee, dt: {"coin": coin, "side": side, "sz": str(sz), "closedPnl": str(pnl), "fee": str(fee), "time": t0 + dt}
+    fills = [
+        f("BTC", "A", 0.01, 0, 0.1, 0),           # open short
+        f("BTC", "B", 0.005, 3.0, 0.05, 3_600_000),  # partial cover
+        f("BTC", "B", 0.005, 3.0, 0.05, 7_200_000),  # closed: +6 - 0.2 fees
+        f("ETH", "B", 1.0, 0, 0.2, 0),             # long
+        f("ETH", "A", 2.0, -5.0, 0.4, 600_000),    # flips to short with a loss
+        f("ETH", "B", 1.0, 1.0, 0.2, 1_200_000),   # short closed
+    ]
+    r = auto.track_record(fills, playbooks)
+    assert r["closed_trades"] == 3
+    btc = [t for t in r["trades"] if t["coin"] == "BTC"][0]
+    assert btc["side"] == "short" and btc["pnl_usd"] == pytest.approx(5.8) and btc["hours"] == 2.0
+    assert btc["legs"] == ["ema_cross@4h"]
+    eth = [t for t in r["trades"] if t["coin"] == "ETH"]
+    assert [t["side"] for t in eth] == ["long", "short"]
+    assert eth[0]["pnl_usd"] == pytest.approx(-5.6) and eth[1]["pnl_usd"] == pytest.approx(0.8)
+    assert r["by_strategy"]["carry_trend@15m"]["trades"] == 2 and r["by_strategy"]["carry_trend@15m"]["pnl_usd"] == pytest.approx(-4.8)
+    assert r["net_pnl_usd"] == pytest.approx(1.0)
+    assert not r["still_open"]
+
+
+def test_track_record_tool_on_a_paper_account(stack):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    agent = auto.PortfolioAgent(s, ex, data, client=object(), runner=auto.PortfolioRunner(s, ex))
+    assert "get_track_record" in {t["name"] for t in agent.tool_defs}
+    assert agent.tool_get_track_record({"days": 7})["closed_trades"] == 0
+
+
 def test_autopilot_falls_back_to_rules_without_llm(stack, monkeypatch):
     from hyperbot import auto
 
@@ -415,3 +527,794 @@ def client_tools(agent):
     from hyperbot.agent import openai_tools
 
     return openai_tools(agent.tool_defs)
+
+
+# ------------------------------------------------------------------ realistic simulation
+def test_walk_book_and_impact():
+    from hyperbot.exchange import sqrt_impact_bps, walk_book
+
+    asks = [(100.0, 1.0), (101.0, 1.0), (102.0, 1.0)]
+    assert walk_book(asks, 0.5) == pytest.approx(100.0)
+    assert walk_book(asks, 2.0) == pytest.approx(100.5)
+    assert walk_book(asks, 6.0) > 102.0  # bigger than the visible book: worse than the last level
+    assert walk_book([], 1.0) is None
+    small, big = sqrt_impact_bps(1e4, 1e9, 3.0), sqrt_impact_bps(1e6, 1e9, 3.0)
+    assert big == pytest.approx(small * 10)  # 100x the size, 10x the impact
+    assert sqrt_impact_bps(1e4, 0, 3.0) == 0.0
+
+
+class BookData(FakeData):
+    """Fake market with an order book, volume and funding."""
+
+    def book_levels(self, coin):
+        m = self.prices[coin]
+        return [(m * 0.999, 10.0), (m * 0.99, 100.0)], [(m * 1.001, 10.0), (m * 1.01, 100.0)]
+
+    def asset_contexts(self):
+        return {c: {"volume_24h_usd": 1e8, "funding_hourly": 0.0001} for c in self.prices}
+
+    def daily_vol_pct(self, coin):
+        return 4.0
+
+
+def test_paper_fills_pay_spread_depth_impact_and_funding(tmp_path):
+    import time as _time
+
+    s = Settings(state_dir=tmp_path, coins=["BTC"], paper_equity=1_000_000, taker_fee=0.0, max_leverage=3)
+    data = BookData()
+    broker = PaperBroker(s, data)
+    f1 = broker.market("BTC", 5.0)  # $500: inside the first level
+    assert f1.price > 100.1  # spread plus a little impact
+    f2 = broker.market("BTC", 50.0)  # $5,000: eats into the second level
+    assert f2.price > f1.price  # deeper book + bigger impact + pressure from the first buy
+    costs = broker.state["costs"]
+    assert costs["spread_and_depth"] > 0 and costs["impact"] > 0
+    # Selling straight after a buy gets no rebate from our own buy pressure.
+    sell = broker.market("BTC", -5.0)
+    assert sell.price < 99.9
+    # Funding: a long pays when the rate is positive.
+    broker.state["funding_time"] = _time.time() - 2 * 3600
+    before = broker.state["cash"]
+    broker.account()
+    assert broker.state["cash"] < before
+    assert costs["funding"] == pytest.approx(50.0 * 100.0 * 0.0001 * 2, rel=0.01)
+
+
+def test_sim_tracker_reports(tmp_path):
+    from hyperbot.sim import SimTracker
+
+    s = Settings(state_dir=tmp_path, coins=["BTC", "ETH"], paper_equity=5000, taker_fee=0.0, slippage_bps=0.0)
+    data = FakeData()
+    broker = PaperBroker(s, data)
+    tracker = SimTracker(s, broker)
+    broker.market("BTC", 25.0)  # $2,500 long
+    tracker.record(broker.account(), data.mids())
+    data.prices.update(BTC=110.0, ETH=9.0)
+    tracker.record(broker.account(), data.mids())
+    rep = tracker.report()
+    assert rep["starting_amount"] == 5000
+    assert rep["trading_return_pct"] == pytest.approx(5.0)  # +10% on half the account
+    assert rep["buy_and_hold_return_pct"] == pytest.approx(0.0)  # +10% and -10%
+    assert rep["trades"] == 1
+
+
+# ------------------------------------------------------------------ service, API
+@pytest.fixture
+def service(stack, monkeypatch):
+    from hyperbot import service as svc_mod
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(svc_mod, "make_broker", lambda settings: broker)
+    svc = svc_mod.Service(s)
+    svc.data = svc.tools.data = data
+    return svc
+
+
+def test_service_trades_through_risk_engine(service):
+    assert service.call("account")["equity_usd"] == 10_000
+    r = service.call("set_target", {"coin": "BTC", "target_usd": "50000", "stop_loss_pct": 2})
+    assert r["status"] == "executed" and r["approved_target_usd"] == pytest.approx(10_000)  # clamped
+    assert service.call("set_target", {"coin": "DOGE", "target_usd": 100, "stop_loss_pct": 2})["status"] == "rejected"
+    assert service.call("kill")["halted"] is True
+    assert service.call("account")["positions"] == []
+    assert service.call("set_target", {"coin": "BTC", "target_usd": 100, "stop_loss_pct": 2})["status"] == "rejected"
+    assert service.call("resume") == {"halted": False}
+    assert "error" in service.call("nope")
+    assert "error" in service.call("signals", {})  # missing argument comes back as an error, not a crash
+    assert "ema_cross" in service.call("strategies")
+
+
+def test_api_auth_and_methods(service):
+    from fastapi.testclient import TestClient
+
+    from hyperbot.api import create_app
+
+    client = TestClient(create_app(service, token="secret"))
+    assert client.get("/health").json()["ok"] is True
+    assert client.get("/v1/account").status_code == 401
+    h = {"Authorization": "Bearer secret"}
+    assert client.get("/v1/account", headers=h).json()["equity_usd"] == 10_000
+    assert "set_target" in client.get("/v1", headers=h).json()["operations"]
+    assert client.get("/v1/set_target", headers=h).status_code == 405  # trading needs POST
+    r = client.post("/v1/set_target", headers=h, json={"coin": "ETH", "target_usd": -1000, "stop_loss_pct": 3})
+    assert r.json()["status"] == "executed"
+    assert client.post("/v1/unknown", headers=h, json={}).status_code == 404
+    for path in ("/docs", "/redoc", "/openapi.json"):  # a public server publishes no map of itself
+        assert client.get(path).status_code in (401, 404), path
+
+
+# ------------------------------------------------------------------ AI cost and net profit
+def test_ai_cost_is_subtracted_from_profit(stack):
+    from hyperbot.agent import TradingAgent
+    from hyperbot.risk import AICostLedger
+    from hyperbot.sim import SimTracker
+
+    s, data, broker, ex = stack
+    s.llm_price_input, s.llm_price_input_cached, s.llm_price_output = 1_000_000.0, 100_000.0, 2_000_000.0  # $1 / $0.10 / $2 per token
+    client = ScriptedClient(
+        [
+            {"calls": [("set_target_position", {"coin": "BTC", "target_usd": 5000, "stop_loss_pct": 5, "take_profit_pct": 0, "thesis": "t"})]},
+            {"text": "done"},
+        ]
+    )
+    summary = TradingAgent(s, ex, data, client=client).run_cycle()
+    # Two model calls, each 10 prompt + 5 completion tokens, nothing cached: 2 * (10*$1 + 5*$2) = $40
+    assert summary["cost_usd"] == pytest.approx(40.0)
+    assert AICostLedger(s).load()["cycles"] == 1
+    assert AICostLedger(s).price(10, 4, 0) == pytest.approx(6 * 1.0 + 4 * 0.1)  # cached tokens are cheaper
+
+    data.prices["BTC"] = 102.0  # +2% on $5,000 = +$100 trading profit
+    acct = ex.account()
+    pnl = ex.risk.pnl(acct.equity)
+    assert pnl["trading_pnl_usd"] == pytest.approx(100.0)
+    assert pnl["ai_cost_usd"] == pytest.approx(40.0)
+    assert pnl["net_pnl_usd"] == pytest.approx(60.0)
+
+    tracker = SimTracker(s, broker)
+    tracker.record(acct, data.mids())
+    rep = tracker.report()
+    assert rep["trading_pnl_usd"] == pytest.approx(100.0) and rep["net_pnl_usd"] == pytest.approx(60.0)
+    assert rep["net_return_pct"] == pytest.approx(0.6)
+
+    data.prices["BTC"] = 99.0  # a trading loss gets bigger once the AI bill is added
+    assert ex.risk.pnl(ex.account().equity)["net_pnl_usd"] == pytest.approx(-50.0 - 40.0)
+
+
+# ------------------------------------------------------------------ luck-adjusted statistics
+def test_sharpe_statistics_separate_edge_from_luck():
+    from hyperbot.stats import deflated_sharpe, expected_max_sharpe, half_kelly, probabilistic_sharpe
+
+    rng = np.random.default_rng(0)
+    edge = pd.Series(rng.normal(0.002, 0.01, 2000))  # real edge, long record
+    noise = pd.Series(rng.normal(0.0, 0.01, 2000))
+    short = edge.iloc[:60]
+    assert probabilistic_sharpe(edge) > 0.99
+    assert 0.05 < probabilistic_sharpe(noise) < 0.95
+    assert probabilistic_sharpe(short) < probabilistic_sharpe(edge)  # same edge, less evidence
+    # The more candidates you tried, the higher the bar and the lower the deflated figure.
+    assert expected_max_sharpe(100, 0.001) > expected_max_sharpe(10, 0.001) > 0
+    assert deflated_sharpe(short, 200, 0.02) < deflated_sharpe(short, 2, 0.02) <= probabilistic_sharpe(short)
+    assert half_kelly(edge) == pytest.approx(0.5 * edge.mean() / edge.var(), rel=1e-9)
+    assert half_kelly(-edge) < 0
+
+
+def test_rule_weights_use_risk_parity_confidence_and_kelly(stack):
+    from hyperbot.auto import finalize_rows, rule_based_allocations
+    from hyperbot.stats import sharpe_stats
+
+    s, *_ = stack
+    rng = np.random.default_rng(1)
+    base = {"oos_trades": 20, "oos_folds": 3, "oos_folds_positive": 3, "fitted_sharpe": 1.0, "atr_pct": 1.0, "live_params": {}, "interval": "4h"}
+    calm = pd.Series(rng.normal(0.003, 0.01, 800))
+    wild = pd.Series(rng.normal(0.006, 0.04, 800))
+    dud = pd.Series(rng.normal(-0.0005, 0.01, 800))  # slightly losing: must be rejected
+    rows = finalize_rows(
+        [
+            {**base, "coin": "BTC", "strategy": "tsmom", "oos_sharpe": 3.0, "oos_volatility_pct": 20.0, "_stats": sharpe_stats(calm)},
+            {**base, "coin": "ETH", "strategy": "ema_cross", "oos_sharpe": 2.0, "oos_volatility_pct": 80.0, "_stats": sharpe_stats(wild)},
+            {**base, "coin": "ETH", "strategy": "macd", "oos_sharpe": 0.6, "oos_volatility_pct": 20.0, "_stats": sharpe_stats(dud)},
+        ]
+    )
+    assert all("_stats" not in r and 0 <= r["dsr"] <= r["psr"] <= 1 for r in rows)
+    allocs = {a["strategy"]: a["weight"] for a in rule_based_allocations(s, {"rows": rows})}
+    assert "macd" not in allocs  # no evidence it beats zero
+    assert allocs["tsmom"] == pytest.approx(4 * allocs["ema_cross"], rel=0.01)  # a quarter of the volatility, four times the weight
+    assert sum(allocs.values()) <= 1.0
+
+
+def test_manager_can_take_profit_close_and_reenter(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["tsmom"])
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: None)
+    runner = auto.PortfolioRunner(s, ex)
+    agent = auto.PortfolioAgent(s, ex, data, client=object(), runner=runner)
+    alloc = {"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 4}
+
+    agent.tool_set_playbook({"allocations": [alloc], "risk_scale": 1.0, "rationale": "r"})
+    runner.step(auto.load_playbook(s))
+    assert broker.get_protection("BTC") == {"stop_px": pytest.approx(95.0), "tp_px": pytest.approx(104.0)}
+
+    data.prices["BTC"] = 105.0  # take-profit hit: banked, and not re-bought on the next tick
+    runner.step(auto.load_playbook(s))
+    assert "BTC" not in broker.account().positions
+    assert broker.account().equity == pytest.approx(10_250)
+    assert runner.step(auto.load_playbook(s))[0]["status"] == "noop"
+
+    agent.tool_set_playbook({"allocations": [alloc], "risk_scale": 1.0, "rationale": "re-enter"})  # a new decision re-opens
+    assert runner.step(auto.load_playbook(s))[0]["status"] == "executed"
+
+    out = agent.tool_close_position({"coin": "BTC", "reason": "bank it"})  # manual close holds the coin closed
+    assert out["status"] == "executed" and "held_closed" in out
+    assert "BTC" not in runner.state.get("trail", {})  # the next BTC trade must not inherit this one's stop
+    assert runner.step(auto.load_playbook(s))[0]["status"] == "noop"
+    assert not broker.account().positions
+
+
+# ------------------------------------------------------------------ dynamic universe
+class UniverseData(FakeData):
+    def asset_contexts(self):
+        def row(px, chg, vol, delisted=False):
+            return {"mark_px": px, "change_24h_pct": chg, "volume_24h_usd": vol, "open_interest_usd": vol / 2,
+                    "funding_annual_pct": 10.0, "funding_hourly": 0.00001, "max_leverage": 5, "delisted": delisted}
+
+        return {
+            "BTC": row(100, 1, 3e9), "ETH": row(10, 2, 1e9), "HYPE": row(30, 25, 4e8), "DOGE": row(1, -3, 2e8),
+            "TINY": row(0.1, 80, 1e5), "DEAD": row(5, 50, 9e8, delisted=True), "PEPE": row(0.01, -18, 6e7),
+        }
+
+
+def test_universe_scan_and_shortlist():
+    from hyperbot import universe
+
+    rows = universe.scan(UniverseData(), 5e6)
+    coins = [r["coin"] for r in rows]
+    assert coins[0] == "BTC" and "TINY" not in coins and "DEAD" not in coins  # illiquid and delisted are out
+    picks = universe.shortlist(rows, ["BTC", "ETH"], 2)
+    assert picks[:2] == ["BTC", "ETH"] and "HYPE" in picks and len(picks) == 4  # biggest mover is included
+
+
+def test_non_core_coins_get_a_tighter_cap_and_must_be_in_universe(stack):
+    s, data, broker, ex = stack
+    data.prices["HYPE"] = 30.0
+    s.core_coins = ["BTC", "ETH"]
+    s.max_position_pct, s.max_alt_position_pct, s.max_leverage = 300.0, 150.0, 5.0
+    assert ex.set_target("HYPE", 5000, stop_loss_pct=5)["status"] == "rejected"  # not researched yet
+    s.coins.append("HYPE")
+    assert ex.set_target("HYPE", 50_000, stop_loss_pct=5)["approved_target_usd"] == pytest.approx(15_000)
+    assert ex.set_target("BTC", 50_000, stop_loss_pct=5)["approved_target_usd"] == pytest.approx(30_000)
+
+
+def test_manager_can_scan_and_research_a_new_coin(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.universe_mode, s.core_coins, s.research_intervals = "auto", ["BTC", "ETH"], ["4h"]
+    udata = UniverseData()
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=900))
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["ema_cross"])
+    agent = auto.PortfolioAgent(s, ex, udata, client=object(), runner=auto.PortfolioRunner(s, ex))
+    names = {t["name"] for t in agent.tool_defs}
+    assert {"scan_market", "research_coin", "search_news", "get_trending", "close_position", "set_playbook"} <= names
+    scan = agent.tool_scan_market({})
+    assert scan["researched_universe"] == ["BTC", "ETH"] and scan["markets"][0]["coin"] == "BTC"
+    assert "error" in agent.tool_research_coin({"coin": "TINY"})  # too illiquid
+    out = agent.tool_research_coin({"coin": "hype"})
+    assert out["rows"] and out["rows"][0]["coin"] == "HYPE" and "psr" in out["rows"][0]
+    assert "HYPE" in s.coins
+    card = auto.load_scorecard(s)
+    assert card["coins"] == s.coins and any(r["coin"] == "HYPE" for r in card["rows"])
+    s2 = Settings(state_dir=s.state_dir, coins=["BTC", "ETH"], core_coins=["BTC", "ETH"], universe_mode="auto")
+    auto.universe.restore(s2)
+    assert "HYPE" in s2.coins  # survives a restart
+
+
+def test_discretionary_and_hedged_playbook(stack, monkeypatch):
+    from hyperbot import auto
+    from hyperbot.strategies import REGISTRY, tradable_strategies
+
+    assert "hold_long" in REGISTRY and "hold_long" not in tradable_strategies()  # usable, but never researched
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    card = _card([{"coin": "ETH", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.0, "atr_pct": 2.0}])
+    pb, warnings = auto.make_playbook(
+        s,
+        card,
+        [
+            {"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.6, "stop_loss_pct": 0, "take_profit_pct": 9},
+            {"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.4, "stop_loss_pct": 4, "take_profit_pct": 0},
+        ],
+        source="llm",
+    )
+    assert not warnings
+    assert [(a["strategy"], a["stop_loss_pct"], a["take_profit_pct"]) for a in pb["allocations"]] == [("hold_long", 6.0, 9.0), ("hold_short", 4.0, 0.0)]
+    auto.PortfolioRunner(s, ex).step(pb)
+    pos = broker.account().positions
+    assert pos["ETH"].notional == pytest.approx(6000) and pos["BTC"].notional == pytest.approx(-4000)  # long one, short the other
+    assert broker.get_protection("ETH") == {"stop_px": pytest.approx(9.4), "tp_px": pytest.approx(10.9)}
+
+
+def test_scorecard_rows_carry_coin_momentum(monkeypatch):
+    from hyperbot import auto
+
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["ema_cross"])
+    rows = auto.score_frame(make_df(n=1200), "X", "1h", BacktestConfig(), log=lambda m: None)
+    assert rows and {"coin_return_7d_pct", "coin_return_30d_pct", "coin_daily_vol_pct"} <= set(rows[0])
+    assert rows[0]["coin_daily_vol_pct"] > 0
+
+
+def test_deposits_do_not_distort_daily_loss_or_drawdown(tmp_path):
+    s = Settings(state_dir=tmp_path, coins=["BTC"], max_daily_loss_pct=10, max_drawdown_pct=30)
+    rm = RiskManager(s)
+    rm.update(5.8, net_deposits=5.8)
+    assert rm.daily_pnl_pct(5.8) == pytest.approx(0.0)
+    rm.update(30.8, net_deposits=30.8)  # a $25 deposit is not a 431% gain
+    assert rm.daily_pnl_pct(30.8) == pytest.approx(0.0)
+    assert rm.state["high_water_mark"] == pytest.approx(30.8)
+    rm.update(27.0, net_deposits=30.8)  # a real loss still registers against the topped-up balance
+    assert rm.daily_pnl_pct(27.0) == pytest.approx(-12.34, abs=0.01)
+    acct = AccountState(27.0, 27.0, 0.0, {})
+    assert not rm.check("BTC", 20.0, acct).approved  # past the 10% daily loss limit
+    rm.update(17.0, net_deposits=20.8)  # withdrawing $10 is not a drawdown
+    assert not rm.state["halted"]
+    assert rm.pnl(17.0, 20.8)["trading_pnl_usd"] == pytest.approx(-3.8)
+
+
+def test_ai_can_set_its_own_limits_within_outer_bounds(stack, monkeypatch):
+    from hyperbot import auto
+    from hyperbot.risk import LIMIT_BOUNDS, set_limit_overrides
+
+    s, data, broker, ex = stack
+    assert "error" in set_limit_overrides(s, {"max_leverage": 10})  # off unless the owner allows it
+    s.ai_sets_limits = True
+    agent = auto.PortfolioAgent(s, ex, data, client=object(), runner=auto.PortfolioRunner(s, ex))
+    out = agent.tool_set_risk_limits(
+        {"max_leverage": 8, "max_position_pct": 500, "max_daily_loss_pct": 99, "max_drawdown_pct": 0,
+         "max_trades_per_day": 0, "max_stop_loss_pct": 25, "require_stop": False, "rationale": "concentrated plan"}
+    )
+    assert out["applied"]["max_leverage"] == 8 and s.max_leverage == 8
+    assert s.max_daily_loss_pct == LIMIT_BOUNDS["max_daily_loss_pct"][1]  # 99% clamped to the outer bound
+    assert s.max_drawdown_pct == 20.0  # 0 = unchanged
+    assert s.require_stop is False and out["limits_now"]["stop_loss_required"] is False
+
+    # No-stop positions are now possible, and the bigger cap is live.
+    r = ex.set_target("BTC", 60_000, stop_loss_pct=None)
+    assert r["status"] == "executed" and r["approved_target_usd"] == pytest.approx(50_000) and r["stop_px"] is None
+    assert broker.get_protection("BTC").get("stop_px") is None
+
+    # The choice survives a restart.
+    s2 = Settings(state_dir=s.state_dir, coins=["BTC", "ETH"], ai_sets_limits=True)
+    RiskManager(s2)
+    assert s2.max_leverage == 8 and s2.require_stop is False
+
+    # A playbook can ask for no stop only while stops are optional.
+    pb, _ = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": -1, "take_profit_pct": 0}])
+    assert pb["allocations"][0]["stop_loss_pct"] == 0.0
+    s.require_stop = True
+    pb, warnings = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": -1, "take_profit_pct": 0}])
+    assert pb["allocations"][0]["stop_loss_pct"] > 0 and warnings
+
+
+def test_trailing_stop_ratchets_and_survives_playbook_rewrites(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    alloc = {"coin": "BTC", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": 4, "breakeven_at_pct": 3}
+    pb, _ = auto.make_playbook(s, None, [alloc])
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(96.0)  # entry 100, 4% stop
+
+    data.prices["BTC"] = 102.0  # winning a little: the stop follows 4% behind the best price
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(97.92)
+
+    data.prices["BTC"] = 103.5  # past the break-even trigger: worst case is now a scratch
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(100.1)
+
+    data.prices["BTC"] = 110.0  # keeps ratcheting: 4% behind 110
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(105.6)
+
+    data.prices["BTC"] = 108.0  # a pullback never moves the stop back
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(105.6)
+
+    # The manager rewrites the plan with a wider stop and a bigger size: the ratchet holds.
+    wider = {**alloc, "weight": 0.9, "stop_loss_pct": 8, "trail_pct": 8}
+    pb2, _ = auto.make_playbook(s, None, [wider])
+    assert runner.step(pb2)[0]["status"] == "executed"
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(105.6)
+
+    data.prices["BTC"] = 105.0  # reversal: out with the profit, and not straight back in
+    runner.step(pb2)
+    assert "BTC" not in broker.account().positions
+    assert broker.account().equity == pytest.approx(10_140, abs=1)  # +250 on the first 50 units, -110 on the add at 108
+    assert runner.step(pb2)[0]["status"] == "noop"
+
+
+def test_trailing_can_be_switched_off_and_works_for_shorts(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    off, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0}])  # trailing is off unless asked for
+    runner.step(off)
+    data.prices["BTC"] = 90.0
+    runner.step(off)
+    # No trailing: the stop stays a fixed 5% from the entry. (Adding at 90 lowered the average entry
+    # to 98.57, so the level is 103.5; without the fix a resize would have dragged it to 94.5.)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(103.5, abs=0.01)
+
+    on, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0, "trail_pct": 3, "breakeven_at_pct": 2}])
+    runner.step(on)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(92.7)  # 3% above the best (lowest) price for a short
+    data.prices["BTC"] = 80.0
+    runner.step(on)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(82.4)
+
+
+def test_backtest_trailing_stop_locks_in_profit():
+    # Up 30%, then all the way back down below the entry.
+    up, down = np.linspace(100, 130, 40), np.linspace(130, 80, 60)
+    close = np.concatenate([np.full(5, 100.0), up, down])
+    idx = pd.date_range("2025-01-01", periods=len(close), freq="1h", tz="UTC")
+    open_ = np.concatenate([[100.0], close[:-1]])
+    df = pd.DataFrame({"open": open_, "high": np.maximum(open_, close), "low": np.minimum(open_, close), "close": close, "volume": 1.0, "funding": 0.0}, index=idx)
+    fixed = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0))
+    trailed = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0, trail_pct=10.0, breakeven_at_pct=10.0))
+    assert fixed.trades.iloc[0]["reason"] == "stop_loss" and fixed.metrics["total_return_pct"] == pytest.approx(-10.0, abs=0.5)
+    assert trailed.trades.iloc[0]["reason"] == "trailing_stop"
+    assert trailed.metrics["total_return_pct"] == pytest.approx(17.0, abs=1.0)  # out 10% below the 130 peak
+    # Break-even alone: the winner ends as a scratch instead of a loss.
+    scratch = run_backtest(df, Fixed(1.0), replace_cfg(FREE, stop_loss_pct=10.0, breakeven_at_pct=10.0))
+    assert scratch.metrics["total_return_pct"] == pytest.approx(0.1, abs=0.2)
+
+
+# ------------------------------------------------------------------ overfitting probability, HRP, time limit
+def test_pbo_tells_real_tuning_from_noise():
+    from hyperbot.stats import pbo_cscv
+
+    rng = np.random.default_rng(3)
+    n = 1600
+    noise = pd.DataFrame(rng.normal(0, 0.01, (n, 12)))  # twelve parameter sets, none with any edge
+    real = noise.copy()
+    real[0] += 0.002  # one parameter set that genuinely works, all the time
+    assert pbo_cscv(real)["pbo"] < 0.1
+    assert pbo_cscv(noise)["pbo"] > 0.3  # the in-sample winner is often below the median out-of-sample
+    assert pbo_cscv(noise.iloc[:, :3]) is None  # too few parameter sets to say anything
+
+
+def test_hrp_treats_correlated_bets_as_one():
+    from hyperbot.stats import hrp_weights
+
+    rng = np.random.default_rng(4)
+    market = rng.normal(0, 0.02, 400)
+    frame = pd.DataFrame(
+        {
+            "a": market + rng.normal(0, 0.002, 400),  # three near-copies of the same bet
+            "b": market + rng.normal(0, 0.002, 400),
+            "c": market + rng.normal(0, 0.002, 400),
+            "d": rng.normal(0, 0.02, 400),  # one independent bet of similar volatility
+        }
+    )
+    w = hrp_weights(frame)
+    assert w.sum() == pytest.approx(1.0)
+    assert w["d"] > 0.35  # plain inverse volatility would give it about 0.25
+    assert w[["a", "b", "c"]].max() < w["d"]
+
+
+def test_backtest_time_limit_exits_stale_trades():
+    df = make_df(n=200, drift=0.0)
+    df["funding"] = 0.0
+    res = run_backtest(df, Fixed(1.0), replace_cfg(FREE, max_hold_bars=24))
+    assert len(res.trades) == 1 and res.trades.iloc[0]["reason"] == "time_limit"
+    held = (res.trades.iloc[0]["exit_time"] - res.trades.iloc[0]["entry_time"]) / pd.Timedelta(hours=1)
+    assert held == 24
+
+
+def test_walk_forward_embargo_shortens_training_only():
+    df = make_df(n=1200)
+    grid = {"fast": [10, 20], "slow": [50, 100]}
+    a = walk_forward(df, "ema_cross", BacktestConfig(), grid=grid, n_splits=3, embargo=0)
+    b = walk_forward(df, "ema_cross", BacktestConfig(), grid=grid, n_splits=3, embargo=40)
+    assert [f["test_start"] for f in a["folds"]] == [f["test_start"] for f in b["folds"]]  # test slices are unchanged
+    assert len(b["oos_equity"]) == len(a["oos_equity"])
+
+
+def test_scorecard_has_pbo_and_rule_uses_hrp(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, *_ = stack
+    monkeypatch.setattr(auto, "tradable_strategies", lambda: ["ema_cross"])
+    rows = auto.score_frame(make_df(n=1500), "BTC", "1h", BacktestConfig(), log=lambda m: None)
+    assert "pbo" in rows[0] and rows[0]["configs_tried"] == 9 and "_oos_daily" in rows[0]
+    returns: dict = {}
+    auto.finalize_rows(rows, returns)
+    assert "_oos_daily" not in rows[0] and "BTC|1h|ema_cross" in returns
+
+    # Three near-identical legs and one independent leg: the rule gives the independent one more.
+    rng = np.random.default_rng(5)
+    days = [str(d.date()) for d in pd.date_range("2026-01-01", periods=120)]
+    market = rng.normal(0.002, 0.02, 120)
+    series = {
+        "BTC|4h|tsmom": market + rng.normal(0, 0.002, 120),
+        "ETH|4h|tsmom": market + rng.normal(0, 0.002, 120),
+        "SOL|4h|tsmom": market + rng.normal(0, 0.002, 120),
+        "HYPE|4h|ou_reversion": rng.normal(0.002, 0.02, 120),
+    }
+    rets = {k: dict(zip(days, map(float, v))) for k, v in series.items()}
+    s.coins[:] = ["BTC", "ETH", "SOL", "HYPE"]
+    base = {"oos_trades": 20, "oos_folds": 3, "oos_folds_positive": 3, "fitted_sharpe": 1.0, "atr_pct": 1.0, "live_params": {}, "interval": "4h", "oos_sharpe": 2.0, "oos_volatility_pct": 30.0}
+    card = {"rows": [{**base, "coin": k.split("|")[0], "strategy": k.split("|")[2]} for k in series]}
+    w = {a["coin"]: a["weight"] for a in auto.rule_based_allocations(s, card, returns=rets)}
+    assert w["HYPE"] > max(w["BTC"], w["ETH"], w["SOL"]) and sum(w.values()) == pytest.approx(1.0)
+    overfit = {"rows": [{**card["rows"][0], "pbo": 0.8}]}
+    assert auto.rule_based_allocations(s, overfit, returns=rets) == []  # overfit tuning is rejected
+
+
+def test_time_limit_closes_a_live_position(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    pb, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_long", "weight": 0.5, "stop_loss_pct": 5, "take_profit_pct": 0, "max_hold_hours": 6}])
+    assert pb["allocations"][0]["max_hold_hours"] == 6
+    runner.step(pb)
+    assert "BTC" in broker.account().positions
+    runner.state["trail"]["BTC"]["opened"] -= 7 * 3600  # seven hours later
+    runner.step(pb)
+    assert "BTC" not in broker.account().positions
+    assert runner.step(pb)[0]["status"] == "noop"  # and it stays out until the plan changes
+
+
+def test_default_wide_trail_protects_a_big_winner(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.default_trail_mult = 2.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    pb, _ = auto.make_playbook(s, None, [{"coin": "BTC", "interval": "4h", "strategy": "hold_short", "weight": 0.5, "stop_loss_pct": 4, "take_profit_pct": 0}])
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(104.0)  # short from 100 with a 4% stop
+    data.prices["BTC"] = 95.0  # +5%: an 8% trail from here (102.6) is the first improvement on the stop
+    runner.step(pb)
+    assert broker.get_protection("BTC")["stop_px"] < 104.0
+    data.prices["BTC"] = 80.0  # +20%: stop is now far below the entry, so most of the gain is locked
+    runner.step(pb)
+    stop = broker.get_protection("BTC")["stop_px"]
+    assert stop == pytest.approx(86.4) and stop < broker.account().positions["BTC"].entry_px
+    assert "2x the stop distance" in ex.risk.limits()["default_trailing"]
+    # A trade can still opt out.
+    off, _ = auto.make_playbook(s, None, [{"coin": "ETH", "interval": "4h", "strategy": "hold_short", "weight": 0.2, "stop_loss_pct": 4, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}])
+    assert off["allocations"][0]["trail_pct"] == -1.0
+
+
+def test_stop_out_triggers_an_immediate_review_with_cooldown(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    s.max_daily_loss_pct, s.max_drawdown_pct = 50.0, 80.0  # keep the loss limits out of this test's way
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    reviews = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (reviews.append(event), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    assert "BTC" in broker.account().positions and reviews == [""]  # the first, routine review
+    pilot.tick()
+    assert len(reviews) == 1  # nothing happened: no extra review
+
+    data.prices["BTC"] = 90.0  # through the stop
+    pilot.tick()
+    assert "BTC" not in broker.account().positions
+    assert len(reviews) == 2 and "BTC long was closed" in reviews[1]
+
+    # A second stop-out straight afterwards waits for the cooldown.
+    auto.make_playbook(s, card, [{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.5, "stop_loss_pct": 3}])
+    pilot.runner.state["blocked"].clear()
+    pilot.runner.state["cooldown"].clear()  # re-entry cooldown is tested on its own; this test is about reviews
+    pilot.tick()
+    assert "BTC" in broker.account().positions
+    data.prices["BTC"] = 80.0
+    pilot.tick()
+    assert "BTC" not in broker.account().positions and len(reviews) == 2
+
+
+def test_sharp_equity_move_triggers_a_review_with_cooldown(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct = 50.0, 80.0, 3.0
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    reviews = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (reviews.append((event, k.get("ask", ""))), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    weight = broker.account().positions["BTC"].notional / 10_000
+    assert weight > 0.1 and len(reviews) == 1
+    data.prices["BTC"] = 100 * (1 + 0.01 / weight)  # +1% of equity: ordinary noise
+    pilot.tick()
+    assert len(reviews) == 1
+    data.prices["BTC"] = 100 * (1 + 0.04 / weight)  # +4% of equity since the last review
+    pilot.tick()
+    assert len(reviews) == 2 and "gained 4.0%" in reviews[1][0] and reviews[1][1] == pilot.MOVE_ASK
+    pilot.tick()
+    assert len(reviews) == 2  # measured from the review just held, so no repeat
+    data.prices["BTC"] = 100 * (1 + 0.005 / weight)  # gives 3.5% back, but inside the half-hour cooldown
+    pilot.tick()
+    assert len(reviews) == 2
+    pilot.last_event_review = 0.0
+    pilot.tick()
+    assert len(reviews) == 3 and "lost" in reviews[2][0]
+    s.review_move_pct = 0.0  # off
+    pilot.last_event_review = 0.0
+    data.prices["BTC"] = 100 * (1 + 0.06 / weight)
+    pilot.tick()
+    assert len(reviews) == 3
+
+
+def test_owner_trailing_cap_overrides_wider_or_off_settings(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.max_trail_pct = 3.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(-1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    wide = {"interval": "4h", "strategy": "hold_short", "weight": 0.3, "stop_loss_pct": 5, "take_profit_pct": 0}
+    pb, _ = auto.make_playbook(s, None, [{**wide, "coin": "BTC", "trail_pct": 8, "breakeven_at_pct": -1}, {**wide, "coin": "ETH", "trail_pct": -1, "breakeven_at_pct": -1}])
+    runner.step(pb)
+    data.prices["BTC"], data.prices["ETH"] = 96.0, 9.6  # shorts from 100 and 10, now +4%
+    runner.step(pb)
+    for coin, entry in (("BTC", 100.0), ("ETH", 10.0)):
+        stop = broker.get_protection(coin)["stop_px"]
+        assert stop == pytest.approx(entry * 0.96 * 1.03) and stop < entry  # 3% behind the best price: profit is locked
+    tight, _ = auto.make_playbook(s, None, [{**wide, "coin": "BTC", "trail_pct": 1, "breakeven_at_pct": 1}])
+    runner.step(tight)
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(96.0 * 1.01)  # tighter than the cap is allowed
+    assert "at most 3%" in ex.risk.limits()["owner_trailing_cap"]
+
+
+def test_profit_target_banks_everything_then_rebuilds(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct, s.profit_target_pct = 50.0, 80.0, 0.0, 5.0
+    s.bank_fraction = 1.0
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    reviews = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (reviews.append((event, k.get("ask", ""))), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    weight = broker.account().positions["BTC"].notional / 10_000
+    assert pilot.runner.state["bank_ref"] == pytest.approx(10_000) and len(reviews) == 1
+    data.prices["BTC"] = 100 * (1 + 0.03 / weight)  # +3%: short of the 5% target
+    pilot.tick()
+    assert len(reviews) == 1 and broker.account().positions["BTC"].entry_px == pytest.approx(100.0)
+    top = 100 * (1 + 0.06 / weight)
+    data.prices["BTC"] = top  # +6% of the account
+    pilot.tick()
+    assert len(reviews) == 2 and "profit target" in reviews[1][0] and reviews[1][1] == pilot.BANK_ASK
+    assert pilot.runner.state["bank_ref"] == pytest.approx(10_600)  # the next target is measured from here
+    assert not pilot.runner.state["blocked"]  # our own close is not a stop-out
+    assert broker.account().positions["BTC"].entry_px == pytest.approx(top)  # closed, then rebuilt from flat
+    pilot.tick()
+    assert len(reviews) == 2  # no repeat until another 5% is made
+    # A jump far beyond the target in one tick looks like a deposit the ledger has not shown yet: wait.
+    data.prices["BTC"] = top * (1 + 0.22 / weight)  # over four times the target, under the 25% that reads as a resize
+    pilot.tick()
+    assert len(reviews) == 2
+    assert "5% of the account per day" in ex.risk.limits()["owner_profit_target"]
+
+
+def test_deposit_seen_in_the_balance_before_the_ledger_is_not_a_drawdown(tmp_path):
+    s = Settings(state_dir=tmp_path, coins=["BTC"], max_daily_loss_pct=10, max_drawdown_pct=30)
+    rm = RiskManager(s)
+    rm.update(33.0, net_deposits=30.8)
+    rm.update(534.0, net_deposits=30.8)  # the $501 has arrived but the ledger has not reported it yet
+    rm.update(534.0, net_deposits=531.8)  # now it has
+    assert rm.state["high_water_mark"] == pytest.approx(534.0) and not rm.state["halted"]
+    assert rm.daily_pnl_pct(534.0) == pytest.approx(0.0, abs=0.5)
+    rm.update(500.0, net_deposits=531.8)  # a real 6% loss afterwards is still measured correctly
+    assert not rm.state["halted"] and rm.daily_pnl_pct(500.0) == pytest.approx(-6.4, abs=0.2)
+    rm.update(370.0, net_deposits=531.8)
+    assert rm.state["halted"]  # and a real 30% drawdown still halts
+
+
+def test_profit_target_banks_half_and_protects_the_rest(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct, s.profit_target_pct = 50.0, 80.0, 0.0, 5.0
+    assert s.bank_fraction == 0.5
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    auto.make_playbook(s, card, [{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.8, "stop_loss_pct": 5, "trail_pct": -1, "breakeven_at_pct": -1}])
+    events = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (events.append(event), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    assert broker.account().positions["BTC"].notional == pytest.approx(8000)
+    data.prices["BTC"] = 107.5  # +7.5% on 0.8x = +6% of the account
+    pilot.tick()
+    pos = broker.account().positions["BTC"]
+    assert pos.notional == pytest.approx(8600 * 0.5, rel=0.02)  # half of the position is banked
+    assert auto.load_playbook(s)["allocations"][0]["weight"] == pytest.approx(0.4)  # and the runner will not rebuild it
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(100.1)  # the rest cannot become a loss
+    assert "50% of every position closed" in events[-1]
+    pilot.tick()
+    assert broker.account().positions["BTC"].notional == pytest.approx(pos.notional, rel=0.02) and len(events) == 2
+
+
+def test_day_sleeve_stops_for_the_day_at_its_target_and_at_its_loss_limit(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.research_intervals, s.day_intervals, s.day_target_pct, s.day_stop_pct = ["15m", "4h"], ["15m"], 2.0, 1.0
+    s.max_daily_loss_pct, s.max_drawdown_pct = 50.0, 80.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    base = {"strategy": "hold_long", "stop_loss_pct": 10, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}
+    pb, _ = auto.make_playbook(s, None, [{**base, "coin": "BTC", "interval": "15m", "weight": 0.5}, {**base, "coin": "BTC", "interval": "4h", "weight": 0.3}])
+    runner.step(pb)
+    assert broker.account().positions["BTC"].notional == pytest.approx(8000)  # both halves on
+    data.prices["BTC"] = 102.0  # the day half (0.5x) has made 1%: not there yet
+    runner.step(pb)
+    assert not runner.state["day"]["done"] and runner.state["day"]["pnl_pct"] == pytest.approx(1.0, abs=0.05)
+    data.prices["BTC"] = 104.5  # now 2.25%: target reached
+    runner.step(pb)
+    assert "daily target" in runner.state["day"]["done"]
+    left = broker.account().positions["BTC"].notional
+    assert left == pytest.approx(0.3 * broker.account().equity, rel=0.02)  # only the swing half remains
+    data.prices["BTC"] = 120.0
+    runner.step(pb)
+    assert runner.state["day"]["pnl_pct"] == pytest.approx(2.25, abs=0.1)  # switched off: no longer earning or losing
+
+    # A new day starts the sleeve again; this time it runs into its loss limit.
+    runner.state["day"]["date"] = "2000-01-01"
+    runner.step(pb)
+    assert not runner.state["day"]["done"] and broker.account().positions["BTC"].notional > left
+    data.prices["BTC"] = 120.0 * 0.975  # -2.5% on 0.5x = -1.25% of the account
+    runner.step(pb)
+    assert "loss limit" in runner.state["day"]["done"]
+    assert "15m" in ex.risk.limits()["day_trading_sleeve"]
