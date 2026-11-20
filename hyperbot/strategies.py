@@ -282,7 +282,7 @@ def tradable_strategies() -> list[str]:
 # On the day-trading sleeve's short candles only these are researched. In a walk-forward test on
 # eight coins (52 days of 15m candles, costs included) the trend and band rules lost on every coin
 # because they trade too often for their edge; these were the ones that did not.
-DAY_STRATEGIES = ("funding_carry", "carry_trend", "rsi_reversion", "tsmom", "vol_breakout", "nday_high")
+DAY_STRATEGIES = ("funding_carry", "carry_trend", "rsi_reversion", "tsmom", "vol_breakout", "nday_high", "trend_carry")
 
 
 # ---------------------------------------------------------------------------
@@ -622,3 +622,152 @@ class IbsReversion(Strategy):
             _b(ibs < p["low"]), _b(ibs > p["exit"]), _b(ibs > 1 - p["low"]), _b(ibs < 1 - p["exit"]), p["allow_short"]
         )
         return pd.Series(pos, index=df.index)
+
+
+# ---------------------------------------------------------------------------
+# Rules distilled from consistently profitable Hyperliquid wallets (a study of 40
+# leaderboard accounts, Nov 2026): swing traders faded 24h extremes and added to
+# winners, day traders bought US-session breakouts of the 24h range, and the
+# steadiest books stayed short the falling coins that paid them funding. Only the
+# last survived walk-forward testing; the others are kept for the record.
+# ---------------------------------------------------------------------------
+
+
+@register
+class FadeExtreme(Strategy):
+    name = "fade_extreme"
+    research = False  # lost over 1,000 daily bars (5 of 17 coins up) and on 1h; positive only on 4h in a falling half-year (walk-forward, Nov 2026)
+    description = "Swing fade of a 24h extreme: buy a 24h drop of N% that closes near its low (short the mirror), unless the week is breaking down; add once in profit, trail a winner, 14-day time stop."
+    defaults = {"move_pct": 3.0, "range_frac": 0.2, "week_guard_pct": 10.0, "stop_atr": 2.5, "trail_atr": 3.0, "max_days": 14, "allow_short": True}
+    grid = {"move_pct": [3.0, 5.0], "stop_atr": [2.0, 3.0]}
+
+    def signal(self, df):
+        p = self.params
+        n = _per_day(df)
+        c = df["close"]
+        r24 = c / c.shift(n) - 1
+        r168 = c / c.shift(7 * n) - 1
+        hi, lo = df["high"].rolling(n).max(), df["low"].rolling(n).min()
+        where = (c - lo) / (hi - lo).replace(0, np.nan)
+        atr = _daily_atr(df).to_numpy()
+        mv, fr, wg = p["move_pct"] / 100, p["range_frac"], p["week_guard_pct"] / 100
+        long_in = ((r24 <= -mv) & (where <= fr) & (r168 > -wg)).to_numpy()
+        short_in = ((r24 >= mv) & (where >= 1 - fr) & (r168 < wg)).to_numpy() if p["allow_short"] else np.zeros(len(c), bool)
+        px = c.to_numpy()
+        out = np.zeros(len(px))
+        pos, entry, stop, best, added, age = 0.0, 0.0, 0.0, 0.0, False, 0
+        limit = int(p["max_days"] * n)
+        for i in range(len(px)):
+            a = atr[i]
+            if not np.isfinite(a) or a <= 0:
+                continue
+            if pos:
+                side = np.sign(pos)
+                age += 1
+                best = max(best, px[i]) if side > 0 else min(best, px[i])
+                if side * (best - entry) >= 2 * a:  # trade is working: trail it
+                    trail = best - side * p["trail_atr"] * a
+                    stop = max(stop, trail) if side > 0 else min(stop, trail)
+                if not added and side * (px[i] - entry) >= 1.5 * a:
+                    pos, added = side * 1.0, True  # add to the winner, never to a loser
+                if (side > 0 and px[i] <= stop) or (side < 0 and px[i] >= stop) or age >= limit:
+                    pos = 0.0
+            if not pos:
+                if long_in[i]:
+                    pos, entry, best, added, age = 2 / 3, px[i], px[i], False, 0
+                    stop = px[i] - p["stop_atr"] * a
+                elif short_in[i]:
+                    pos, entry, best, added, age = -2 / 3, px[i], px[i], False, 0
+                    stop = px[i] + p["stop_atr"] * a
+            out[i] = pos
+        return pd.Series(out, index=df.index)
+
+
+@register
+class TrendCarry(Strategy):
+    name = "trend_carry"
+    description = "Trend side that is paid funding: short a falling coin (7-day return negative, below its 7-day average) while longs pay funding, adding into rallies; long mirror optional. Exit on a new 7-day extreme against it, a reversal of the week, or funding flipping."
+    defaults = {"side": -1, "use_funding": True, "add_pct": 3.0, "exit_week_pct": 5.0}
+    grid = {"side": [-1, 0, 1], "use_funding": [True, False]}
+
+    def signal(self, df):
+        p = self.params
+        n = _per_day(df)
+        c = df["close"]
+        r24 = (c / c.shift(n) - 1).to_numpy()
+        r168 = (c / c.shift(7 * n) - 1).to_numpy()
+        avg = c.rolling(7 * n).mean().to_numpy()
+        hi = df["high"].shift(1).rolling(7 * n).max().to_numpy()
+        lo = df["low"].shift(1).rolling(7 * n).min().to_numpy()
+        f = df["funding"] if "funding" in df.columns else pd.Series(0.0, index=df.index)
+        fund = f.rolling(n).mean().to_numpy()
+        px = c.to_numpy()
+        sides = (-1, 1) if int(p["side"]) == 0 else (int(p["side"]),)
+        add, wk = p["add_pct"] / 100, p["exit_week_pct"] / 100
+        out = np.zeros(len(px))
+        pos, units, last_add = 0, 0, -1
+        for i in range(len(px)):
+            if not (np.isfinite(avg[i]) and np.isfinite(hi[i]) and np.isfinite(r168[i])):
+                continue
+            paid = {-1: fund[i] > 0, 1: fund[i] < 0} if p["use_funding"] else {-1: True, 1: True}
+            if pos:
+                against = px[i] > hi[i] if pos < 0 else px[i] < lo[i]
+                week_turned = (r168[i] > wk) if pos < 0 else (r168[i] < -wk)
+                if against or week_turned or (p["use_funding"] and not paid[pos] and fund[i] != 0):
+                    pos, units = 0, 0
+                elif units < 3 and i - last_add >= n and pos * r24[i] <= -add and (px[i] < avg[i] if pos < 0 else px[i] > avg[i]):
+                    units, last_add = units + 1, i  # add into the counter-move, still on the right side of the average
+            if not pos:
+                for s in sides:
+                    trend_ok = (r168[i] < 0 and px[i] < avg[i]) if s < 0 else (r168[i] > 0 and px[i] > avg[i])
+                    if trend_ok and paid[s]:
+                        pos, units, last_add = s, 1, i
+                        break
+            out[i] = pos * units / 3
+        return pd.Series(out, index=df.index)
+
+
+@register
+class SessionBreakout(Strategy):
+    name = "session_breakout"
+    research = False  # about break-even on 15m (4 of 8 coins) and lost on 1h (3 of 8) after costs (walk-forward, Nov 2026)
+    description = "US-session breakout: on bars closing 12:00-20:00 UTC, enter when price closes beyond the prior 24h high or low; stop at the range midpoint, add once in profit, take profit at 1.5 day-ranges, exit back inside the range or after 24h."
+    defaults = {"start_hour": 12, "end_hour": 20, "target_atr": 1.5, "max_hours": 24, "allow_short": True}
+    grid = {"target_atr": [1.0, 1.5, 2.5], "max_hours": [12, 24]}
+    intervals = INTRADAY_INTERVALS
+
+    def signal(self, df):
+        p = self.params
+        n = _per_day(df)
+        c = df["close"].to_numpy()
+        hi = df["high"].shift(1).rolling(n).max().to_numpy()
+        lo = df["low"].shift(1).rolling(n).min().to_numpy()
+        atr = _daily_atr(df).to_numpy()
+        close_time = df.index + pd.Timedelta(hours=24 / n)
+        hours = close_time.hour.to_numpy()
+        in_session = (hours >= int(p["start_hour"])) & (hours <= int(p["end_hour"]))
+        limit = max(int(p["max_hours"] * n / 24), 1)
+        out = np.zeros(len(c))
+        pos, entry, stop, level, age, added = 0.0, 0.0, 0.0, 0.0, 0, False
+        for i in range(len(c)):
+            a = atr[i]
+            if not (np.isfinite(hi[i]) and np.isfinite(a) and a > 0):
+                continue
+            if pos:
+                side = np.sign(pos)
+                age += 1
+                if not added and side * (c[i] - entry) >= 0.5 * a:
+                    pos, added = side * 1.0, True
+                hit_stop = c[i] <= stop if side > 0 else c[i] >= stop
+                target = side * (c[i] - entry) >= p["target_atr"] * a
+                back_in = c[i] < level if side > 0 else c[i] > level
+                if hit_stop or target or back_in or age >= limit:
+                    pos = 0.0
+            if not pos and in_session[i]:
+                mid = (hi[i] + lo[i]) / 2
+                if c[i] > hi[i]:
+                    pos, entry, stop, level, age, added = 2 / 3, c[i], mid, hi[i], 0, False
+                elif p["allow_short"] and c[i] < lo[i]:
+                    pos, entry, stop, level, age, added = -2 / 3, c[i], mid, lo[i], 0, False
+            out[i] = pos
+        return pd.Series(out, index=df.index)

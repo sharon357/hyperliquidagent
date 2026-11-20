@@ -176,14 +176,19 @@ These are owner settings; the AI works inside them.
 | `HL_MAX_TRAIL_PCT` | Cap on the trailing and break-even distance. Trades may be tighter, never wider or off. 0 = no cap |
 | `HL_REVIEW_MOVE_PCT` | Extra AI review when profit or loss has moved this many percent of equity since the last review (default 3) |
 | `HL_REVIEW_EVERY` | Scheduled AI review interval for `hyperbot serve` |
+| `HL_STOP_COOLDOWN_HOURS` | After a stop-out at a loss, that side of the coin stays shut this long, even if the AI writes a new playbook (default 4, 0 = off). Exits in profit do not count |
 
 The AI is also called at once when a stop, take-profit, trailing stop or time limit closes a position, at most once per half hour. A stop on an open position only ever tightens.
+
+Before each playbook the AI reads `get_track_record`: every closed trade rebuilt from the exchange's own fills, after fees, tagged with the strategy that was on that coin when it opened and totalled per strategy. The scorecard says what worked in a backtest; this says what worked live.
+
+The runner computes each live signal on the same history research used (`HL_RESEARCH_DAYS`), so the rule that trades is the rule that was scored. A test checks every researched strategy for this.
 
 ## Day-trading sleeve
 
 Set `HL_DAY_INTERVALS=15m` to split the book in two. Allocations on that candle size are the day-trading sleeve; everything else is the swing sleeve. The bot keeps a separate running result for the day sleeve and switches it off until the next UTC day once it has made `HL_DAY_TARGET_PCT` percent of the account or lost `HL_DAY_STOP_PCT` percent. Because the exchange nets every strategy on a coin into one position, the sleeve's result is tracked on paper from its exposure and price changes, with fees charged on each change.
 
-On the sleeve's candles only six strategies are researched (`funding_carry`, `carry_trend`, `rsi_reversion`, `tsmom`, `vol_breakout`, `nday_high`). In a walk-forward test on eight coins the others lost on almost every coin after costs, because they trade too often for their edge.
+On the sleeve's candles only seven strategies are researched (`funding_carry`, `carry_trend`, `rsi_reversion`, `tsmom`, `vol_breakout`, `nday_high`, `trend_carry`). In a walk-forward test on eight coins the others lost on almost every coin after costs, because they trade too often for their edge.
 
 ## Strategies from published research
 
@@ -195,6 +200,18 @@ Eight rules were added from Quantpedia, Quant Memo, the awesome-systematic-tradi
 | `nday_high` | Long after a close at an N-day high, short after an N-day low | Mildly positive at 1h |
 | `rsi2_pullback` | Buy a very oversold 2-period RSI in an uptrend, and the mirror image | Mildly positive at 4h |
 | `session_window`, `opening_range`, `mtf_macd`, `atr_bands`, `ibs_reversion` | Time-of-day, opening-range, multi-timeframe MACD and two mean-reversion rules | Lost on nearly every coin at every timeframe; not researched or traded by the autopilot |
+
+## Strategies from the best Hyperliquid wallets
+
+Forty leaderboard accounts chosen for consistency (up weeks, Sharpe, drawdown), not size, were studied from their public fills in November 2026. Their recurring behaviour was turned into three rules and walk-forward tested with costs and funding on 8 coins at 15m, 1h and 4h, and on 1,000 daily candles across 17 coins:
+
+| Strategy | Copied from | Result |
+|---|---|---|
+| `trend_carry` | Books that stay short falling coins while longs pay them funding, adding into rallies | Strong at 15m (7 of 8 coins), flat to negative at 1h and 4h, middling over 1,000 days with a low overfitting score. Researched; the scorecard decides where it is used |
+| `fade_extreme` | Swing traders fading 24h moves of 3% or more and adding to winners | Positive at 4h in the last half-year only; lost over 1,000 days (5 of 17 coins up). Not researched |
+| `session_breakout` | Day traders entering US-session breaks of the 24h range | Break-even at 15m, lost at 1h. Not researched |
+
+The most profitable day traders hold for seconds to minutes. That edge needs sub-second execution and maker fees, and cannot be copied by a bot that decides every five minutes.
 
 `HL_MAX_UNIVERSE` sets how many coins are researched at once (default 12). Research runs in a background thread, so open positions keep being managed while it runs.
 

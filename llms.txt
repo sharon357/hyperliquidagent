@@ -89,6 +89,8 @@ Subclass `Strategy` in `hyperbot/strategies.py`, set `name`, `description`, `def
 - `HL_DAY_INTERVALS`, `HL_DAY_TARGET_PCT`, `HL_DAY_STOP_PCT`: allocations on those candle sizes form a day-trading sleeve that is switched off until the next UTC day at its daily target or loss limit. `playbook` reports it as `day_sleeve_today`.
 - The manager is also called when a stop or target closes a position and when profit or loss moves `HL_REVIEW_MOVE_PCT` percent of equity, at most once per half hour.
 - A stop on an open position only tightens. Do not close and reopen a position to loosen one.
+- `HL_STOP_COOLDOWN_HOURS` (default 4): after a stop-out at a loss, that side of the coin stays shut that long, and a new playbook does not lift it. `playbook` lists active ones under `cooldown_after_stop`.
+- The manager has a `get_track_record` tool: closed trades rebuilt from exchange fills, net of fees, totalled per strategy and timeframe.
 - The `account` operation's `risk.limits` block states all of these as the bot currently applies them.
 
 ## Known limits

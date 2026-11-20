@@ -73,6 +73,8 @@ def test_live_window_matches_research_signal(name):
     1,920 bars), and path-dependent rules drift when they start too late. Checked on 15m candles, the
     fastest interval the bot trades, with the window as a share of the history the way the runner loads it.
     """
+    if not REGISTRY[name].research:
+        pytest.skip("not researched, so make_playbook never lets it trade")
     df = make_df(n=5000, seed=3)
     df.index = pd.date_range("2025-01-01", periods=len(df), freq="15min", tz="UTC")
     strat = get_strategy(name)
