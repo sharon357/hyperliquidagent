@@ -3,7 +3,7 @@
 A command-line trading bot for Hyperliquid perpetuals:
 
 - **Backtesting** with fees, slippage, funding, leverage, stops and liquidation, plus parameter search and walk-forward testing.
-- **Fourteen strategies** (trend, momentum, breakout, mean reversion, funding carry, regime switching, ensemble, plus volatility-targeted forecast blends, a half-life-gated reversion rule and a self-checking trend rule).
+- **Twenty-two strategies** (trend, momentum, breakout, mean reversion, funding carry, regime switching, ensemble, volatility-targeted forecast blends, a half-life-gated reversion rule, a self-checking trend rule, and eight rules taken from published research write-ups). Seventeen are researched and traded by the autopilot; five lost in testing and are kept for manual backtests only.
 - **An LLM agent** (DeepSeek by default) that reads quant signals, recent strategy performance and market sentiment, then manages positions.
 - **A risk engine in plain code** that every order passes through. The agent cannot exceed it.
 - **Three modes**: `paper` (simulated fills at real prices, the default), `testnet`, `mainnet`.
@@ -164,6 +164,40 @@ Coins outside the core list get a tighter per-coin cap (`HL_MAX_ALT_POSITION_PCT
 
 The manager's instructions set an explicit goal: maximise long-run account growth aggressively, through well-reasoned concentrated bets, without bets that could end the account. How aggressive it can be is bounded by the limits in `.env`.
 
+## Profit taking, trailing and automatic reviews
+
+These are owner settings; the AI works inside them.
+
+| Setting | What it does |
+|---|---|
+| `HL_PROFIT_TARGET_PCT` | Each time the account has gained this many percent since the last bank, the bot takes profit and calls the AI to redeploy. The AI is told this is the daily goal. 0 = off |
+| `HL_BANK_FRACTION` | Share of every position closed at the target (default 0.5). The stop on what is left moves to break-even if the position is in profit. 1 = close everything |
+| `HL_DEFAULT_TRAIL_MULT` | Trailing stop used when a trade does not set its own, as a multiple of its stop distance. 0 = none |
+| `HL_MAX_TRAIL_PCT` | Cap on the trailing and break-even distance. Trades may be tighter, never wider or off. 0 = no cap |
+| `HL_REVIEW_MOVE_PCT` | Extra AI review when profit or loss has moved this many percent of equity since the last review (default 3) |
+| `HL_REVIEW_EVERY` | Scheduled AI review interval for `hyperbot serve` |
+
+The AI is also called at once when a stop, take-profit, trailing stop or time limit closes a position, at most once per half hour. A stop on an open position only ever tightens.
+
+## Day-trading sleeve
+
+Set `HL_DAY_INTERVALS=15m` to split the book in two. Allocations on that candle size are the day-trading sleeve; everything else is the swing sleeve. The bot keeps a separate running result for the day sleeve and switches it off until the next UTC day once it has made `HL_DAY_TARGET_PCT` percent of the account or lost `HL_DAY_STOP_PCT` percent. Because the exchange nets every strategy on a coin into one position, the sleeve's result is tracked on paper from its exposure and price changes, with fees charged on each change.
+
+On the sleeve's candles only six strategies are researched (`funding_carry`, `carry_trend`, `rsi_reversion`, `tsmom`, `vol_breakout`, `nday_high`). In a walk-forward test on eight coins the others lost on almost every coin after costs, because they trade too often for their edge.
+
+## Strategies from published research
+
+Eight rules were added from Quantpedia, Quant Memo, the awesome-systematic-trading collection and QuantifiedTrader, then walk-forward tested on eight coins at 15m, 1h and 4h with costs (November 2026):
+
+| Strategy | Idea | Result |
+|---|---|---|
+| `vol_breakout` | Close beyond the N-day range by a fraction of a day's range; trailing exit | Best on all three timeframes, but from about six trades per coin in a falling market |
+| `nday_high` | Long after a close at an N-day high, short after an N-day low | Mildly positive at 1h |
+| `rsi2_pullback` | Buy a very oversold 2-period RSI in an uptrend, and the mirror image | Mildly positive at 4h |
+| `session_window`, `opening_range`, `mtf_macd`, `atr_bands`, `ibs_reversion` | Time-of-day, opening-range, multi-timeframe MACD and two mean-reversion rules | Lost on nearly every coin at every timeframe; not researched or traded by the autopilot |
+
+`HL_MAX_UNIVERSE` sets how many coins are researched at once (default 12). Research runs in a background thread, so open positions keep being managed while it runs.
+
 ## How strategies are judged and sized
 
 The research step and the AI's instructions apply standard results from the systematic-trading literature:
@@ -202,6 +236,7 @@ Set in `.env`, enforced in `hyperbot/risk.py` for the agent, the strategy runner
 | `HL_MAX_DRAWDOWN_PCT` | 20 | Past this, trading halts until `hyperbot resume` |
 | `HL_MAX_TRADES_PER_DAY` | 20 | Cap on position-increasing trades |
 | `HL_DEFAULT_STOP_LOSS_PCT` / `HL_MAX_STOP_LOSS_PCT` | 3 / 10 | Every position gets a stop |
+| `HL_AI_SETS_LIMITS` | no | If yes, the AI manager may change these limits inside fixed outer bounds (leverage up to 20x) |
 
 Orders that reduce risk are always allowed. Requests above a cap are shrunk to fit.
 

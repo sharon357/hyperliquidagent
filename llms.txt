@@ -1,6 +1,6 @@
 # hyperbot
 
-> A command-line trading bot for Hyperliquid perpetual futures: backtesting, ten rule-based strategies, a risk engine, an LLM-driven autopilot, a realistic paper simulator, an HTTP API and an MCP server. Python 3.10+. Default mode is paper trading (simulated fills at live prices); nothing trades real money unless HL_MODE=mainnet and HL_CONFIRM_MAINNET=yes are set.
+> A command-line trading bot for Hyperliquid perpetual futures: backtesting, twenty-two rule-based strategies (seventeen used by the autopilot), a risk engine, an LLM-driven autopilot, a realistic paper simulator, an HTTP API and an MCP server. Python 3.10+. Default mode is paper trading (simulated fills at live prices); nothing trades real money unless HL_MODE=mainnet and HL_CONFIRM_MAINNET=yes are set.
 
 This file is for AI agents working with or through this project.
 
@@ -81,10 +81,18 @@ Run `hyperbot COMMAND --help` for options.
 
 ## Adding a strategy
 
-Subclass `Strategy` in `hyperbot/strategies.py`, set `name`, `description`, `defaults` and `grid`, implement `signal(df)`, and decorate with `@register`. The test suite checks every registered strategy for range and look-ahead.
+Subclass `Strategy` in `hyperbot/strategies.py`, set `name`, `description`, `defaults` and `grid`, implement `signal(df)`, and decorate with `@register`. The test suite checks every registered strategy for range and look-ahead. Set `research = False` on a strategy to keep it out of the autopilot, and `intervals` to limit the candle sizes it runs on.
+
+## Autopilot behaviour set by the owner
+
+- `HL_PROFIT_TARGET_PCT` and `HL_BANK_FRACTION`: at that gain since the last bank, the bot closes that share of every position, moves the remaining stops to break-even where in profit, and calls the manager to redeploy.
+- `HL_DAY_INTERVALS`, `HL_DAY_TARGET_PCT`, `HL_DAY_STOP_PCT`: allocations on those candle sizes form a day-trading sleeve that is switched off until the next UTC day at its daily target or loss limit. `playbook` reports it as `day_sleeve_today`.
+- The manager is also called when a stop or target closes a position and when profit or loss moves `HL_REVIEW_MOVE_PCT` percent of equity, at most once per half hour.
+- A stop on an open position only tightens. Do not close and reopen a position to loosen one.
+- The `account` operation's `risk.limits` block states all of these as the bot currently applies them.
 
 ## Known limits
 
 - Backtests ignore order-book depth and latency. The paper simulator walks the live book and adds a square-root impact estimate, but it cannot change the real price path or model how other traders would react to the orders.
-- The live order path (testnet/mainnet) has had read-only checks only.
+- The live order path has been run on mainnet with small real positions; treat it as lightly tested.
 - State lives in JSON files under `state/`; running the autopilot and the API/MCP server against the same account at once can race.
