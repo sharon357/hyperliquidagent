@@ -1084,3 +1084,41 @@ def test_owner_trailing_cap_overrides_wider_or_off_settings(stack, monkeypatch):
     runner.step(tight)
     assert broker.get_protection("BTC")["stop_px"] == pytest.approx(96.0 * 1.01)  # tighter than the cap is allowed
     assert "at most 3%" in ex.risk.limits()["owner_trailing_cap"]
+
+
+def test_profit_target_banks_everything_then_rebuilds(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct, s.profit_target_pct = 50.0, 80.0, 0.0, 5.0
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    reviews = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (reviews.append((event, k.get("ask", ""))), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    weight = broker.account().positions["BTC"].notional / 10_000
+    assert pilot.runner.state["bank_ref"] == pytest.approx(10_000) and len(reviews) == 1
+    data.prices["BTC"] = 100 * (1 + 0.03 / weight)  # +3%: short of the 5% target
+    pilot.tick()
+    assert len(reviews) == 1 and broker.account().positions["BTC"].entry_px == pytest.approx(100.0)
+    top = 100 * (1 + 0.06 / weight)
+    data.prices["BTC"] = top  # +6% of the account
+    pilot.tick()
+    assert len(reviews) == 2 and "profit target" in reviews[1][0] and reviews[1][1] == pilot.BANK_ASK
+    assert pilot.runner.state["bank_ref"] == pytest.approx(10_600)  # the next target is measured from here
+    assert not pilot.runner.state["blocked"]  # our own close is not a stop-out
+    assert broker.account().positions["BTC"].entry_px == pytest.approx(top)  # closed, then rebuilt from flat
+    pilot.tick()
+    assert len(reviews) == 2  # no repeat until another 5% is made
+    # A jump far beyond the target in one tick looks like a deposit the ledger has not shown yet: wait.
+    data.prices["BTC"] = top * (1 + 0.22 / weight)  # over four times the target, under the 25% that reads as a resize
+    pilot.tick()
+    assert len(reviews) == 2
+    assert "5% of the account per day" in ex.risk.limits()["owner_profit_target"]

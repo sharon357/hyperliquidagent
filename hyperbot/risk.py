@@ -265,6 +265,12 @@ class RiskManager:
                 if s.default_trail_mult > 0
                 else "none unless a trade sets its own"
             ),
+            "owner_profit_target": (
+                f"{s.profit_target_pct:g}% of the account per day, banked: the engine closes every position each time the "
+                f"account has gained {s.profit_target_pct:g}% since the last bank, then calls you to rebuild from flat"
+                if s.profit_target_pct > 0
+                else "none"
+            ),
             "owner_trailing_cap": (
                 f"every position trails at most {s.max_trail_pct:g}% behind its best price and moves to break-even "
                 f"once {s.max_trail_pct:g}% in profit at the latest; a trade may set tighter values, never wider or off"

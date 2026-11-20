@@ -68,6 +68,7 @@ class Settings:
     max_stop_loss_pct: float = 10.0
     rebalance_band: float = 0.10  # ignore resizes smaller than 10 % of the position
     require_stop: bool = True  # every position must carry a stop-loss
+    profit_target_pct: float = 0.0  # owner's goal in percent of the account: close everything each time this much is gained since the last bank (0 = off)
     review_move_pct: float = 3.0  # extra manager review when profit or loss moves this many percent of equity since the last one (0 = off)
     max_trail_pct: float = 0.0  # owner's cap on the trailing and break-even distance, in percent; trades may be tighter, never wider or off (0 = no cap)
     default_trail_mult: float = 0.0  # trailing used when a trade does not set its own: this many times its stop distance (0 = none)
@@ -156,6 +157,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         default_trail_mult=_float("HL_DEFAULT_TRAIL_MULT", d.default_trail_mult),
         max_trail_pct=_float("HL_MAX_TRAIL_PCT", d.max_trail_pct),
         review_move_pct=_float("HL_REVIEW_MOVE_PCT", d.review_move_pct),
+        profit_target_pct=_float("HL_PROFIT_TARGET_PCT", d.profit_target_pct),
         ai_sets_limits=_bool("HL_AI_SETS_LIMITS", d.ai_sets_limits),
         exposure_multiplier=_float("HL_EXPOSURE_MULTIPLIER", d.exposure_multiplier),
         llm_api_key=(os.getenv("HL_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip(),

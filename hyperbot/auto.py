@@ -531,6 +531,8 @@ The owner's goal: maximise the long-run growth of this account, aggressively. Th
 
 What the owner is hoping for is days of roughly 0.5% to 10% on the account. Treat that as a statement of appetite, not a quota. Returns of that size only come from positions that are large relative to the account, in markets that actually move, held while the move is happening; a 1x position in a coin that moves 2% a day cannot produce them. So look for where the movement and the edge are, and size to it. Equally, a day with no good setup is a day to hold what is working or wait: forcing trades to hit a number is how accounts are lost, and no one compounds at these rates without long stretches of drawdown. Your job is the best risk-adjusted aggression available today, not a fixed daily figure.
 
+If the limits in `get_account` show an `owner_profit_target` other than "none", that is the owner's concrete goal: that many percent of the account per day, banked. The engine closes every position by itself each time the account has gained that much since the last bank, then calls you to rebuild from a flat book. Your job is to give the account a real chance of reaching it. That means several positions with different drivers across the whole universe rather than one crowded bet repeated in correlated coins; sizes and leverage at which an ordinary day's move in your favour gets there; and going to find candidates with `scan_market` and `research_coin` whenever the scorecard is thin, instead of holding two majors and waiting. Be honest with yourself about the number: it is far above what these strategies average, so most days will fall short and some will lose. A day that falls short is fine. A trade with no evidence behind it, taken only to chase the number, is not, and neither is loosening a brake after a loss to win it back.
+
 Be decisive. Do not pad a decision with reasons to be smaller, do not treat an extreme sentiment reading as grounds to shrink a position the evidence supports (it is one input, already reflected in price), and do not cut a position's size merely because the account is small. If you find yourself listing risks without a specific, likely scenario attached, that is caution for its own sake: drop it and size the trade.
 
 There is no preferred market. BTC, ETH and SOL are in the scorecard because they are the most liquid, not because they are the right answer, and for a small account chasing growth they often are not: their daily ranges are small. Compare candidates on what they can earn for this account: expected move (`coin_daily_vol_pct`, `atr_pct`, recent returns), strength of evidence (`psr`, `dsr`, folds), and whether the minimum order lets you hold a meaningful position. Pick a major only when it wins on those terms.
@@ -907,11 +909,58 @@ class AutoPilot:
         "Work out why it happened and whether the reason for the trade is finished or has reversed, then decide what "
         "the account should hold now: stay out, re-enter the same way, or take the other side. "
     )
+    BANK_ASK = (
+        "The profit is banked and the book is flat. Decide what to open now for the next leg toward the target. Look "
+        "across the whole universe first; re-enter a trade you just closed only if it is still among the best available "
+        "at the current price, not out of habit. "
+    )
     MOVE_ASK = (
         "Work out what drove it and whether the reasons for the open trades still hold, then decide: bank some or all "
         "of a gain, cut what is not working, move stops, change sizes, or leave everything alone. Leaving it alone is "
         "the right answer when the thesis is intact and the move is ordinary noise; do not trade just because you were asked. "
     )
+
+    def _bank(self, equity: float, profit: float) -> str:
+        """Close everything once the account has gained the owner's target since the last bank.
+
+        Returns a description of what happened, or "" when nothing was banked. The reference
+        point lives in the runner's state file so a restart does not reset it.
+        """
+        pct = self.s.profit_target_pct
+        if pct <= 0 or self.executor.dry_run:
+            return ""
+        state = self.runner.state
+        if state.get("bank_ref") is None:
+            state["bank_ref"] = profit
+            _write(self.runner.path, state)
+            return ""
+        gain = profit - state["bank_ref"]
+        base = equity - gain  # what the account would be worth without this gain; deposits are already excluded
+        if base <= 0 or gain < base * pct / 100:
+            self._bank_doubt = 0
+            return ""
+        if gain > 4 * base * pct / 100:
+            # Far too much for one tick: almost certainly a deposit the ledger has not reported yet.
+            # Only believe it if it is still there on the third look.
+            self._bank_doubt = getattr(self, "_bank_doubt", 0) + 1
+            if self._bank_doubt < 3:
+                return ""
+        self._bank_doubt = 0
+        reason = f"profit target reached: +${gain:,.2f} ({gain / base * 100:.1f}%) since the last bank"
+        with self.lock:
+            had_positions = bool(self.executor.account().positions)
+            self.executor.flatten_all(source="autopilot", reason=reason)
+            after = self.executor.account().equity
+        # These closes were ours: do not let the runner read them as stop-outs or carry their stops over.
+        state["applied"].clear()
+        state.get("trail", {}).clear()
+        state["bank_ref"] = profit + (after - equity)
+        _write(self.runner.path, state)
+        self.executor.journal.write("banked", gain_usd=round(gain, 2), gain_pct=round(gain / base * 100, 2), equity=round(after, 2))
+        self.log(f"{reason}: all positions closed, equity ${after:,.2f}")
+        if not had_positions:
+            return ""
+        return f"the account reached the owner's profit target (+${gain:,.2f}, {gain / base * 100:.1f}% since the last bank) and every position was closed to bank it"
 
     def manage(self, card: dict, fresh_research: bool, event: str = "", ask: str = STOP_ASK) -> None:
         """Let the LLM (or the fallback rule) decide the playbook. `event` says why, if it is not a routine review."""
@@ -968,7 +1017,11 @@ class AutoPilot:
         if resized:
             self.log(f"account size changed from ${self.last_review_equity:,.2f} to ${equity:,.2f}: reviewing the playbook")
         profit = equity - (self.executor._deposits() or 0.0)  # deposits and withdrawals are not profit or loss
-        if fresh or resized or load_playbook(self.s) is None or time.time() - self.last_review > self.review_seconds:
+        banked = self._bank(equity, profit)
+        if banked:
+            self.last_review_equity, self.last_review_profit = equity, profit
+            self.manage(card, fresh, event=banked, ask=self.BANK_ASK)
+        elif fresh or resized or load_playbook(self.s) is None or time.time() - self.last_review > self.review_seconds:
             self.last_review_equity, self.last_review_profit = equity, profit
             self.manage(card, fresh)
         with self.lock:  # only the part that trades holds the account lock

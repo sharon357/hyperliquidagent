@@ -9,12 +9,14 @@ agent can pull further coins in by researching them.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .config import Settings
 from .data import HLData
 
-MAX_UNIVERSE = 12
+# How many coins are researched at once. More coins means a longer research run and a bigger scorecard.
+MAX_UNIVERSE = min(max(int(os.getenv("HL_MAX_UNIVERSE", "12") or 12), 3), 40)
 
 
 def scan(data: HLData, min_volume_usd: float) -> list[dict]:
