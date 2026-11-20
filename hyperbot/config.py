@@ -68,6 +68,10 @@ class Settings:
     max_stop_loss_pct: float = 10.0
     rebalance_band: float = 0.10  # ignore resizes smaller than 10 % of the position
     require_stop: bool = True  # every position must carry a stop-loss
+    bank_fraction: float = 0.5  # share of every position closed when the profit target is hit (1 = close everything)
+    day_intervals: list[str] = field(default_factory=list)  # candle sizes that make up the day-trading sleeve, e.g. ['15m']
+    day_target_pct: float = 0.0  # the day sleeve stops for the day once it has made this many percent of the account (0 = no target)
+    day_stop_pct: float = 0.0  # ... or lost this many (0 = no daily stop)
     profit_target_pct: float = 0.0  # owner's goal in percent of the account: close everything each time this much is gained since the last bank (0 = off)
     review_move_pct: float = 3.0  # extra manager review when profit or loss moves this many percent of equity since the last one (0 = off)
     max_trail_pct: float = 0.0  # owner's cap on the trailing and break-even distance, in percent; trades may be tighter, never wider or off (0 = no cap)
@@ -123,6 +127,7 @@ def load_settings(env_file: str | None = None) -> Settings:
     universe_mode = os.getenv("HL_UNIVERSE", d.universe_mode).strip().lower() or d.universe_mode
     if universe_mode not in ("fixed", "auto"):
         raise ValueError("HL_UNIVERSE must be 'fixed' or 'auto'")
+    _day = [i.strip() for i in os.getenv("HL_DAY_INTERVALS", "").split(",") if i.strip()]
     s = Settings(
         core_coins=list(coins),
         universe_mode=universe_mode,
@@ -158,6 +163,10 @@ def load_settings(env_file: str | None = None) -> Settings:
         max_trail_pct=_float("HL_MAX_TRAIL_PCT", d.max_trail_pct),
         review_move_pct=_float("HL_REVIEW_MOVE_PCT", d.review_move_pct),
         profit_target_pct=_float("HL_PROFIT_TARGET_PCT", d.profit_target_pct),
+        bank_fraction=min(max(_float("HL_BANK_FRACTION", d.bank_fraction), 0.1), 1.0),
+        day_intervals=_day,
+        day_target_pct=_float("HL_DAY_TARGET_PCT", d.day_target_pct),
+        day_stop_pct=_float("HL_DAY_STOP_PCT", d.day_stop_pct),
         ai_sets_limits=_bool("HL_AI_SETS_LIMITS", d.ai_sets_limits),
         exposure_multiplier=_float("HL_EXPOSURE_MULTIPLIER", d.exposure_multiplier),
         llm_api_key=(os.getenv("HL_LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY") or "").strip(),
@@ -170,7 +179,8 @@ def load_settings(env_file: str | None = None) -> Settings:
         llm_price_input_cached=_float("HL_LLM_PRICE_INPUT_CACHED", d.llm_price_input_cached),
         llm_price_output=_float("HL_LLM_PRICE_OUTPUT", d.llm_price_output),
         research_days=_float("HL_RESEARCH_DAYS", d.research_days),
-        research_intervals=[i.strip() for i in os.getenv("HL_RESEARCH_INTERVALS", "1h,4h").split(",") if i.strip()],
+        # the day sleeve's candle sizes are researched too
+        research_intervals=list(dict.fromkeys([i.strip() for i in os.getenv("HL_RESEARCH_INTERVALS", "1h,4h").split(",") if i.strip()] + _day)),
     )
     s.ensure_dirs()
     return s

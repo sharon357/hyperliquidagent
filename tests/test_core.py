@@ -152,7 +152,10 @@ def test_grid_search_and_walk_forward_run():
 def test_quant_snapshot_is_json_serialisable():
     snap = quant_snapshot(make_df(n=700))
     json.dumps(snap)
-    assert set(snap["strategy_signals"]) == set(REGISTRY) - {"buy_hold", "hold_long", "hold_short"}
+    from hyperbot.strategies import tradable_strategies
+
+    assert set(snap["strategy_signals"]) == set(tradable_strategies())
+    assert "opening_range" in REGISTRY and "opening_range" not in tradable_strategies()  # kept for backtests only
 
 
 # ------------------------------------------------------------------ risk + execution
@@ -1097,6 +1100,7 @@ def test_profit_target_banks_everything_then_rebuilds(stack, monkeypatch):
     monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
     monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
     s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct, s.profit_target_pct = 50.0, 80.0, 0.0, 5.0
+    s.bank_fraction = 1.0
     pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
     reviews = []
     original = pilot.manage
@@ -1136,3 +1140,69 @@ def test_deposit_seen_in_the_balance_before_the_ledger_is_not_a_drawdown(tmp_pat
     assert not rm.state["halted"] and rm.daily_pnl_pct(500.0) == pytest.approx(-6.4, abs=0.2)
     rm.update(370.0, net_deposits=531.8)
     assert rm.state["halted"]  # and a real 30% drawdown still halts
+
+
+def test_profit_target_banks_half_and_protects_the_rest(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    card = _card([{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "oos_sharpe": 1.5}])
+    card["generated"] = auto.utc_now().isoformat()
+    card["rows"][0]["pbo"] = 0.1
+    monkeypatch.setattr(auto, "load_scorecard", lambda s_: card)
+    s.max_daily_loss_pct, s.max_drawdown_pct, s.review_move_pct, s.profit_target_pct = 50.0, 80.0, 0.0, 5.0
+    assert s.bank_fraction == 0.5
+    pilot = auto.AutoPilot(s, ex, use_llm=False, log=lambda m: None)
+    auto.make_playbook(s, card, [{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.8, "stop_loss_pct": 5, "trail_pct": -1, "breakeven_at_pct": -1}])
+    events = []
+    original = pilot.manage
+    monkeypatch.setattr(pilot, "manage", lambda c, fresh, event="", **k: (events.append(event), original(c, fresh, event, **k))[1])
+
+    pilot.tick()
+    assert broker.account().positions["BTC"].notional == pytest.approx(8000)
+    data.prices["BTC"] = 107.5  # +7.5% on 0.8x = +6% of the account
+    pilot.tick()
+    pos = broker.account().positions["BTC"]
+    assert pos.notional == pytest.approx(8600 * 0.5, rel=0.02)  # half of the position is banked
+    assert auto.load_playbook(s)["allocations"][0]["weight"] == pytest.approx(0.4)  # and the runner will not rebuild it
+    assert broker.get_protection("BTC")["stop_px"] == pytest.approx(100.1)  # the rest cannot become a loss
+    assert "50% of every position closed" in events[-1]
+    pilot.tick()
+    assert broker.account().positions["BTC"].notional == pytest.approx(pos.notional, rel=0.02) and len(events) == 2
+
+
+def test_day_sleeve_stops_for_the_day_at_its_target_and_at_its_loss_limit(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.research_intervals, s.day_intervals, s.day_target_pct, s.day_stop_pct = ["15m", "4h"], ["15m"], 2.0, 1.0
+    s.max_daily_loss_pct, s.max_drawdown_pct = 50.0, 80.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    runner = auto.PortfolioRunner(s, ex)
+    base = {"strategy": "hold_long", "stop_loss_pct": 10, "take_profit_pct": 0, "trail_pct": -1, "breakeven_at_pct": -1}
+    pb, _ = auto.make_playbook(s, None, [{**base, "coin": "BTC", "interval": "15m", "weight": 0.5}, {**base, "coin": "BTC", "interval": "4h", "weight": 0.3}])
+    runner.step(pb)
+    assert broker.account().positions["BTC"].notional == pytest.approx(8000)  # both halves on
+    data.prices["BTC"] = 102.0  # the day half (0.5x) has made 1%: not there yet
+    runner.step(pb)
+    assert not runner.state["day"]["done"] and runner.state["day"]["pnl_pct"] == pytest.approx(1.0, abs=0.05)
+    data.prices["BTC"] = 104.5  # now 2.25%: target reached
+    runner.step(pb)
+    assert "daily target" in runner.state["day"]["done"]
+    left = broker.account().positions["BTC"].notional
+    assert left == pytest.approx(0.3 * broker.account().equity, rel=0.02)  # only the swing half remains
+    data.prices["BTC"] = 120.0
+    runner.step(pb)
+    assert runner.state["day"]["pnl_pct"] == pytest.approx(2.25, abs=0.1)  # switched off: no longer earning or losing
+
+    # A new day starts the sleeve again; this time it runs into its loss limit.
+    runner.state["day"]["date"] = "2000-01-01"
+    runner.step(pb)
+    assert not runner.state["day"]["done"] and broker.account().positions["BTC"].notional > left
+    data.prices["BTC"] = 120.0 * 0.975  # -2.5% on 0.5x = -1.25% of the account
+    runner.step(pb)
+    assert "loss limit" in runner.state["day"]["done"]
+    assert "15m" in ex.risk.limits()["day_trading_sleeve"]

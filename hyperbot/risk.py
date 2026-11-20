@@ -281,10 +281,28 @@ class RiskManager:
                 else "none unless a trade sets its own"
             ),
             "owner_profit_target": (
-                f"{s.profit_target_pct:g}% of the account per day, banked: the engine closes every position each time the "
-                f"account has gained {s.profit_target_pct:g}% since the last bank, then calls you to rebuild from flat"
+                f"{s.profit_target_pct:g}% of the account per day, banked: each time the account has gained "
+                f"{s.profit_target_pct:g}% since the last bank the engine "
+                + (
+                    "closes every position, then calls you to rebuild from flat"
+                    if s.bank_fraction >= 1
+                    else f"closes {s.bank_fraction:.0%} of every position, moves the stops on what is left to break-even where it can, and calls you to redeploy the freed capital"
+                )
                 if s.profit_target_pct > 0
                 else "none"
+            ),
+            "day_trading_sleeve": (
+                f"allocations on {', '.join(s.day_intervals)} candles form the day-trading sleeve; the engine switches the whole sleeve off until the next UTC day once it has "
+                + " or ".join(
+                    x
+                    for x in (
+                        f"made {s.day_target_pct:g}% of the account" if s.day_target_pct > 0 else "",
+                        f"lost {s.day_stop_pct:g}% of the account" if s.day_stop_pct > 0 else "",
+                    )
+                    if x
+                )
+                if s.day_intervals and (s.day_target_pct > 0 or s.day_stop_pct > 0)
+                else (f"allocations on {', '.join(s.day_intervals)} candles" if s.day_intervals else "none")
             ),
             "owner_trailing_cap": (
                 f"every position trails at most {s.max_trail_pct:g}% behind its best price and moves to break-even "

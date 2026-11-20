@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import contextlib
+import threading
 import json
 import os
 import time
@@ -31,7 +32,7 @@ from .config import Settings
 from .data import HLData, interval_ms, load_history
 from .risk import LIMIT_BOUNDS, Executor, set_limit_overrides, utc_now
 from .stats import expected_max_sharpe, hrp_weights, pbo_cscv, psr_from_stats, sharpe_stats
-from .strategies import DISCRETIONARY, get_strategy, tradable_strategies
+from .strategies import DAY_STRATEGIES, DISCRETIONARY, get_strategy, tradable_strategies
 
 MAX_ALLOCATIONS = 8
 WF_SPLITS = 3
@@ -54,7 +55,7 @@ def _age_seconds(iso: str) -> float:
 
 
 # ------------------------------------------------------------------ research
-def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable[[str], None] = print) -> list[dict]:
+def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable[[str], None] = print, only: tuple | None = None) -> list[dict]:
     """Scorecard rows for every strategy on one coin/timeframe history."""
     rows = []
     close = df["close"]
@@ -73,6 +74,9 @@ def score_frame(df, coin: str, interval: str, cfg: BacktestConfig, log: Callable
     }
     for name in tradable_strategies():
         grid = get_strategy(name).grid
+        allowed = get_strategy(name).intervals
+        if (allowed and interval not in allowed) or (only is not None and name not in only):
+            continue  # e.g. a time-of-day rule on 4h candles, or a slow trend rule on the day sleeve's candles
         try:
             trials: dict = {}
             fitted = grid_search(df, name, cfg, returns_out=trials).iloc[0]
@@ -186,7 +190,7 @@ def build_scorecard(settings: Settings, log: Callable[[str], None] = print) -> d
             except Exception as e:
                 log(f"research: no data for {coin} {interval}: {e}")
                 continue
-            rows.extend(score_frame(df, coin, interval, cfg, log))
+            rows.extend(score_frame(df, coin, interval, cfg, log, DAY_STRATEGIES if interval in settings.day_intervals else None))
             log(f"research: {coin} {interval} done ({len(df)} bars)")
     returns: dict = {}
     finalize_rows(rows, returns)
@@ -371,9 +375,55 @@ class PortfolioRunner:
         self.state = _read(self.path) or {"applied": {}, "blocked": {}}
         self.review_requested: str | None = None  # set when a stop, target or time limit closes a position
 
+    def _day_state(self) -> dict:
+        """Today's record for the day-trading sleeve. Profit restarts at each UTC midnight; open exposure carries over."""
+        today = utc_now().strftime("%Y-%m-%d")
+        day = self.state.get("day")
+        if not day or day.get("date") != today:
+            day = {"date": today, "pnl_pct": 0.0, "done": "", "pos": (day or {}).get("pos", {})}
+            self.state["day"] = day
+        return day
+
+    def _mark_day_sleeve(self, mids: dict) -> None:
+        """Add what the sleeve's exposure earned since the last look, then apply the daily target and stop.
+
+        The account nets every strategy on a coin into one position, so the sleeve's result is
+        tracked on paper: its exposure (as a fraction of equity) times each coin's price change.
+        """
+        day = self._day_state()
+        for coin, (frac, px) in list(day["pos"].items()):
+            now = mids.get(coin)
+            if now and px:
+                day["pnl_pct"] += frac * (now / px - 1) * 100
+                day["pos"][coin] = [frac, now]
+        if day["done"]:
+            return
+        target, stop = self.s.day_target_pct, self.s.day_stop_pct
+        if target > 0 and day["pnl_pct"] >= target:
+            day["done"] = f"made its daily target (+{day['pnl_pct']:.2f}% of the account)"
+        elif stop > 0 and day["pnl_pct"] <= -stop:
+            day["done"] = f"hit its daily loss limit ({day['pnl_pct']:.2f}% of the account)"
+        if day["done"]:
+            self.executor.journal.write("day_sleeve", date=day["date"], pnl_pct=round(day["pnl_pct"], 3), outcome=day["done"])
+
+    def _record_day_sleeve(self, targets: dict, mids: dict) -> None:
+        """Remember the sleeve's new exposure and charge it the cost of getting there."""
+        day = self._day_state()
+        cost = (self.s.taker_fee + self.s.slippage_bps / 10_000) * 100
+        coins = set(day["pos"]) | {c for c, t in targets.items() if t.get("day_fraction")}
+        for coin in coins:
+            new = float(targets.get(coin, {}).get("day_fraction", 0.0))
+            old = day["pos"].get(coin, [0.0, 0.0])[0]
+            day["pnl_pct"] -= abs(new - old) * cost
+            if abs(new) < 1e-9 or not mids.get(coin):
+                day["pos"].pop(coin, None)
+            else:
+                day["pos"][coin] = [new, mids[coin]]
+
     def targets(self, playbook: dict) -> dict[str, dict]:
         """Net target exposure per coin (as a fraction of equity) and the stop to use."""
         out: dict[str, dict] = {}
+        day_off = bool(self.s.day_intervals) and bool(self._day_state()["done"])
         for a in playbook.get("allocations", []):
             days = 800 * interval_ms(a["interval"]) / 86_400_000
             df = load_history(a["coin"], a["interval"], days, self.s.data_dir)
@@ -382,7 +432,13 @@ class PortfolioRunner:
             tp = a.get("take_profit_pct") or 0.0
             if tp and (not t["take_profit_pct"] or tp < t["take_profit_pct"]):
                 t["take_profit_pct"] = tp  # the nearest target among this coin's allocations
-            t["fraction"] += sig * a["weight"] * playbook.get("risk_scale", 1.0) * self.s.exposure_multiplier
+            part = sig * a["weight"] * playbook.get("risk_scale", 1.0) * self.s.exposure_multiplier
+            in_day_sleeve = a["interval"] in self.s.day_intervals
+            if in_day_sleeve:
+                if day_off:
+                    part = 0.0  # the sleeve is finished for today
+                t["day_fraction"] = t.get("day_fraction", 0.0) + part
+            t["fraction"] += part
             stops = [x for x in (t["stop_loss_pct"], a["stop_loss_pct"]) if x]
             t["stop_loss_pct"] = min(stops) if stops else 0.0
             hold = a.get("max_hold_hours") or 0.0
@@ -397,7 +453,7 @@ class PortfolioRunner:
                     t[key] = min(new, old)
                 elif new >= 0 and old < 0 or (new > 0 and old == 0):
                     t[key] = new
-            t["parts"].append(f"{a['strategy']}@{a['interval']}={sig:+.2f}")
+            t["parts"].append(f"{a['strategy']}@{a['interval']}={sig:+.2f}" + (" (day sleeve off until tomorrow)" if in_day_sleeve and day_off else ""))
         return out
 
     def _trail(self, coin: str, t: dict, pos) -> str | None:
@@ -477,7 +533,13 @@ class PortfolioRunner:
 
     def step(self, playbook: dict | None) -> list[dict]:
         playbook = playbook or {"allocations": []}
+        track_day = bool(self.s.day_intervals) and not self.executor.dry_run
+        mids = self.executor.broker.mids() if track_day else {}
+        if track_day:
+            self._mark_day_sleeve(mids)  # before the targets, so a target or stop hit now takes effect now
         targets = self.targets(playbook)
+        if track_day:
+            self._record_day_sleeve(targets, mids)
         acct = self.executor.account()
         applied, blocked = self.state["applied"], self.state["blocked"]
         results = []
@@ -532,6 +594,8 @@ The owner's goal: maximise the long-run growth of this account, aggressively. Th
 What the owner is hoping for is days of roughly 0.5% to 10% on the account. Treat that as a statement of appetite, not a quota. Returns of that size only come from positions that are large relative to the account, in markets that actually move, held while the move is happening; a 1x position in a coin that moves 2% a day cannot produce them. So look for where the movement and the edge are, and size to it. Equally, a day with no good setup is a day to hold what is working or wait: forcing trades to hit a number is how accounts are lost, and no one compounds at these rates without long stretches of drawdown. Your job is the best risk-adjusted aggression available today, not a fixed daily figure.
 
 If the limits in `get_account` show an `owner_profit_target` other than "none", that is the owner's concrete goal: that many percent of the account per day, banked. The engine closes every position by itself each time the account has gained that much since the last bank, then calls you to rebuild from a flat book. Your job is to give the account a real chance of reaching it. That means several positions with different drivers across the whole universe rather than one crowded bet repeated in correlated coins; sizes and leverage at which an ordinary day's move in your favour gets there; and going to find candidates with `scan_market` and `research_coin` whenever the scorecard is thin, instead of holding two majors and waiting. Be honest with yourself about the number: it is far above what these strategies average, so most days will fall short and some will lose. A day that falls short is fine. A trade with no evidence behind it, taken only to chase the number, is not, and neither is loosening a brake after a loss to win it back.
+
+If the limits show a `day_trading_sleeve`, the book has two halves and the owner wants both used. The swing half is what you have always run: strategies on 1h and 4h candles that hold for days. The day-trading half is any allocation on the sleeve's candle size (15m): rules that open and close within hours, such as `opening_range`, `session_window`, `mtf_macd` and the short-horizon mean-reversion rules. Give each half roughly half of the exposure you are running. The engine keeps a separate tally for the day half (`day_sleeve_today` in `get_playbook`) and switches that half off until the next UTC day once it has made its daily target or lost its daily limit, so one bad morning cannot be traded into a bad day. Hold the day half to the same evidence standard as everything else: short-candle rules trade often, so costs eat them first, their history is only a few weeks long, and their backtests are the easiest to overfit. If no 15m row has a positive out-of-sample result with a believable `psr` and `pbo`, leave the day half empty and say so; an empty sleeve costs nothing, a forced one bleeds fees.
 
 The owner has also said plainly that the leverage used so far, roughly 2x to 4x of equity in total, is too light for what they want. Total exposure of 5x to 10x of equity is what they have in mind when several positions have real evidence behind them, and `set_risk_limits` lets you raise the leverage cap toward its outer bound for a plan that warrants it. Leverage is not a substitute for evidence: it multiplies whatever edge or lack of edge the positions have. At higher leverage do the arithmetic every time: what the whole book loses if every stop is hit at once must stay inside the daily-loss limit you have chosen, which usually means tighter stops in price terms, more positions with different drivers, or a hedge leg, not the same stops on bigger size.
 
@@ -781,7 +845,7 @@ class PortfolioAgent(TradingAgent):
         for interval in self.s.research_intervals:
             try:
                 df = load_history(coin, interval, self.s.research_days, self.s.data_dir)
-                rows.extend(score_frame(df, coin, interval, cfg, log=problems.append))
+                rows.extend(score_frame(df, coin, interval, cfg, problems.append, DAY_STRATEGIES if interval in self.s.day_intervals else None))
             except Exception as e:
                 problems.append(f"{interval}: {e}")
         if not rows:
@@ -841,6 +905,11 @@ class PortfolioAgent(TradingAgent):
             "live_targets": live,
             "blocked_after_stop": self.runner.state["blocked"],
             "trailing_stops": self.runner.state.get("trail", {}),
+            "day_sleeve_today": (
+                {k: (round(v, 3) if isinstance(v, float) else v) for k, v in self.runner._day_state().items() if k != "pos"}
+                if self.s.day_intervals
+                else "not in use"
+            ),
         }
 
     def tool_close_position(self, a: dict) -> dict:
@@ -912,9 +981,10 @@ class AutoPilot:
         "the account should hold now: stay out, re-enter the same way, or take the other side. "
     )
     BANK_ASK = (
-        "The profit is banked and the book is flat. Decide what to open now for the next leg toward the target. Look "
-        "across the whole universe first; re-enter a trade you just closed only if it is still among the best available "
-        "at the current price, not out of habit. "
+        "Profit has been banked and capital is free. Decide what to do with it for the next leg toward the target. Look "
+        "across the whole universe first. Do not simply add back to positions that were just reduced: what is left of "
+        "them is still running, and re-enter a trade that was closed only if it is still among the best available at "
+        "the current price. "
     )
     MOVE_ASK = (
         "Work out what drove it and whether the reasons for the open trades still hold, then decide: bank some or all "
@@ -949,20 +1019,61 @@ class AutoPilot:
                 return ""
         self._bank_doubt = 0
         reason = f"profit target reached: +${gain:,.2f} ({gain / base * 100:.1f}%) since the last bank"
+        keep = 1.0 - self.s.bank_fraction
         with self.lock:
-            had_positions = bool(self.executor.account().positions)
-            self.executor.flatten_all(source="autopilot", reason=reason)
+            positions = dict(self.executor.account().positions)
+            if keep <= 0:
+                self.executor.flatten_all(source="autopilot", reason=reason)
+            else:
+                self._bank_part(positions, keep, reason)
             after = self.executor.account().equity
-        # These closes were ours: do not let the runner read them as stop-outs or carry their stops over.
-        state["applied"].clear()
-        state.get("trail", {}).clear()
+        if keep <= 0:
+            # These closes were ours: do not let the runner read them as stop-outs or carry their stops over.
+            state["applied"].clear()
+            state.get("trail", {}).clear()
         state["bank_ref"] = profit + (after - equity)
         _write(self.runner.path, state)
-        self.executor.journal.write("banked", gain_usd=round(gain, 2), gain_pct=round(gain / base * 100, 2), equity=round(after, 2))
-        self.log(f"{reason}: all positions closed, equity ${after:,.2f}")
-        if not had_positions:
+        did = "all positions closed" if keep <= 0 else f"{self.s.bank_fraction:.0%} of every position closed, stops on the rest moved to break-even where in profit"
+        self.executor.journal.write("banked", gain_usd=round(gain, 2), gain_pct=round(gain / base * 100, 2), equity=round(after, 2), action=did)
+        self.log(f"{reason}: {did}, equity ${after:,.2f}")
+        if not positions:
             return ""
-        return f"the account reached the owner's profit target (+${gain:,.2f}, {gain / base * 100:.1f}% since the last bank) and every position was closed to bank it"
+        return f"the account reached the owner's profit target (+${gain:,.2f}, {gain / base * 100:.1f}% since the last bank): {did}"
+
+    def _bank_part(self, positions: dict, keep: float, reason: str) -> None:
+        """Close part of every position, shrink the playbook to match and protect what is left."""
+        state = self.runner.state
+        kept = set()
+        for coin, pos in positions.items():
+            target = pos.notional * keep
+            if abs(target) < 2 * self.s.min_order_usd:
+                target = 0.0  # too small to split: take all of it
+            self.executor.set_target(coin, target, source="autopilot", reason=reason, refresh_protection=False)
+            if target == 0.0:
+                state["applied"].pop(coin, None)
+                state.get("trail", {}).pop(coin, None)
+                continue
+            kept.add(coin)
+            side = 1 if pos.size > 0 else -1
+            trail = state.get("trail", {}).get(coin)
+            if trail and side * (pos.mark_px / pos.entry_px - 1) > 0.003:
+                # In profit: the rest can no longer turn into a loss. The runner places this level on its next pass.
+                entry = pos.entry_px * (1 + side * 0.001)
+                trail["stop"] = max(trail["stop"] or -np.inf, entry) if side > 0 else min(trail["stop"] or np.inf, entry)
+        pb = load_playbook(self.s)
+        if pb:
+            # The runner sizes positions from these weights, so without this it would rebuild them at once.
+            for a in pb.get("allocations", []):
+                a["weight"] = round(a["weight"] * keep, 4) if a["coin"] in kept else a["weight"]
+            pb["allocations"] = [a for a in pb["allocations"] if a["coin"] in kept or a["coin"] not in positions]
+            _write(Path(self.s.state_dir) / "playbook.json", pb)
+
+    def _research_job(self) -> None:
+        try:
+            build_scorecard(self.s, self.log)
+            self._research_done = True
+        except Exception as e:  # keep the old scorecard; the next tick tries again
+            self.log(f"research failed: {type(e).__name__}: {e}")
 
     def manage(self, card: dict, fresh_research: bool, event: str = "", ask: str = STOP_ASK) -> None:
         """Let the LLM (or the fallback rule) decide the playbook. `event` says why, if it is not a routine review."""
@@ -995,8 +1106,9 @@ class AutoPilot:
             or card.get("coins", self.s.coins) != list(self.s.coins)
             or (self.s.universe_mode == "auto" and not universe._path(self.s).is_file())  # first run in auto mode
             or any("pbo" not in r for r in card.get("rows", [])[:1])  # scorecard written by an older version
+            or not set(self.s.day_intervals) <= {r["interval"] for r in card.get("rows", [])}  # day sleeve switched on since
         )
-        if card is None or stale:
+        if (card is None or stale) and not (getattr(self, "_research", None) and self._research.is_alive()):
             self.log("running research (backtests and walk-forward on every strategy); this takes a few minutes")
             if self.s.universe_mode == "auto":
                 try:
@@ -1010,8 +1122,17 @@ class AutoPilot:
                     self.log(f"universe for this research run: {', '.join(self.s.coins)}")
                 except Exception as e:
                     self.log(f"universe scan failed, keeping {self.s.coins}: {e}")
-            card = build_scorecard(self.s, self.log)
-            fresh = True
+            if card is None:
+                card = build_scorecard(self.s, self.log)  # nothing to trade on yet: wait for it
+                fresh = True
+            elif not getattr(self, "_research", None) or not self._research.is_alive():
+                # Keep trading on the previous scorecard while the new one is built; on a wide
+                # universe this takes long enough that stops and trails must not wait for it.
+                self._research = threading.Thread(target=self._research_job, daemon=True)
+                self._research.start()
+        if getattr(self, "_research_done", False):
+            self._research_done, fresh = False, True
+            card = load_scorecard(self.s) or card
         with self.lock:
             equity = self.executor.account().equity
         # A deposit or withdrawal changes what sizes are possible, so decide again.
