@@ -708,7 +708,7 @@ def api(
     if host not in ("127.0.0.1", "localhost", "::1") and not token:
         console.print("[red]Refusing to listen on a public address without HL_API_TOKEN set.[/red]")
         raise typer.Exit(2)
-    console.print(f"API on http://{host}:{port}  (docs at /docs, token {'required' if token else 'not set: localhost only'})")
+    console.print(f"API on http://{host}:{port}  (token {'required, docs pages off' if token else 'not set: localhost only, docs at /docs'})")
     uvicorn.run(create_app(token=token), host=host, port=port, log_level="warning")
 
 

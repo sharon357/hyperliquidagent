@@ -73,6 +73,7 @@ class Settings:
     day_target_pct: float = 0.0  # the day sleeve stops for the day once it has made this many percent of the account (0 = no target)
     day_stop_pct: float = 0.0  # ... or lost this many (0 = no daily stop)
     profit_target_pct: float = 0.0  # owner's goal in percent of the account: close everything each time this much is gained since the last bank (0 = off)
+    stop_cooldown_hours: float = 4.0  # after a stop-out, no re-entry on the same side of that coin for this long, whatever the playbook says (0 = off)
     review_move_pct: float = 3.0  # extra manager review when profit or loss moves this many percent of equity since the last one (0 = off)
     max_trail_pct: float = 0.0  # owner's cap on the trailing and break-even distance, in percent; trades may be tighter, never wider or off (0 = no cap)
     default_trail_mult: float = 0.0  # trailing used when a trade does not set its own: this many times its stop distance (0 = none)
@@ -162,6 +163,7 @@ def load_settings(env_file: str | None = None) -> Settings:
         default_trail_mult=_float("HL_DEFAULT_TRAIL_MULT", d.default_trail_mult),
         max_trail_pct=_float("HL_MAX_TRAIL_PCT", d.max_trail_pct),
         review_move_pct=_float("HL_REVIEW_MOVE_PCT", d.review_move_pct),
+        stop_cooldown_hours=max(_float("HL_STOP_COOLDOWN_HOURS", d.stop_cooldown_hours), 0.0),
         profit_target_pct=_float("HL_PROFIT_TARGET_PCT", d.profit_target_pct),
         bank_fraction=min(max(_float("HL_BANK_FRACTION", d.bank_fraction), 0.1), 1.0),
         day_intervals=_day,

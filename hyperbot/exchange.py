@@ -83,6 +83,11 @@ class Broker:
     def mids(self) -> dict[str, float]:
         raise NotImplementedError
 
+    def fills(self, since_ms: int) -> list[dict]:
+        """The account's own fills since `since_ms`, in the exchange's format (coin, side, px, sz, dir,
+        closedPnl, fee, time). Brokers without an exchange history return nothing."""
+        return []
+
     def market(self, coin: str, delta_units: float, reduce_only: bool = False) -> Fill:
         """Trade `delta_units` (signed) at market."""
         raise NotImplementedError
@@ -388,6 +393,18 @@ class HyperliquidBroker(Broker):
 
     def mids(self) -> dict[str, float]:
         return {k: float(v) for k, v in self.info.all_mids().items()}
+
+    def fills(self, since_ms: int) -> list[dict]:
+        out, start = [], int(since_ms)
+        for _ in range(10):  # the exchange returns at most 2,000 fills per call
+            batch = self.info.post("/info", {"type": "userFillsByTime", "user": self.address, "startTime": start, "aggregateByTime": True})
+            if not batch:
+                break
+            out += batch
+            if len(batch) < 2000:
+                break
+            start = max(int(f["time"]) for f in batch) + 1
+        return out
 
     def net_deposits(self) -> float | None:
         """USDC paid into the account minus USDC taken out, from the exchange's ledger (cached for a minute)."""

@@ -420,12 +420,41 @@ class PortfolioRunner:
             else:
                 day["pos"][coin] = [new, mids[coin]]
 
+    def _cool(self, coin: str, side: int, entry: float | None = None, price: float | None = None) -> None:
+        """Start the post-stop cooldown: the same side of this coin stays shut for `stop_cooldown_hours`.
+
+        Only for exits at a loss. A take-profit, or a trailing stop that locked in a gain, is the trade
+        working; the trend may well continue, so re-entering it stays open.
+        """
+        if self.s.stop_cooldown_hours <= 0 or not side:
+            return
+        if entry is None:
+            entry = self.state.get("trail", {}).get(coin, {}).get("entry")
+        if price is None and entry:
+            try:
+                price = float(self.executor.broker.mids().get(coin) or 0) or None
+            except Exception:
+                price = None
+        if entry and price and side * (price - entry) > 0:
+            return
+        self.state.setdefault("cooldown", {})[coin] = {"side": int(side), "until": time.time() + self.s.stop_cooldown_hours * 3600}
+
+    def cooling(self, coin: str) -> int:
+        """The side (+1/-1) of `coin` still in its post-stop cooldown, or 0."""
+        c = self.state.get("cooldown", {})
+        for k in [k for k, v in c.items() if v["until"] <= time.time()]:
+            c.pop(k)
+        return c[coin]["side"] if coin in c else 0
+
     def targets(self, playbook: dict) -> dict[str, dict]:
         """Net target exposure per coin (as a fraction of equity) and the stop to use."""
         out: dict[str, dict] = {}
         day_off = bool(self.s.day_intervals) and bool(self._day_state()["done"])
         for a in playbook.get("allocations", []):
-            days = 800 * interval_ms(a["interval"]) / 86_400_000
+            # The same history research scored the strategy on. 800 bars was too short for rules with
+            # multi-day lookbacks on fast candles (a 20-day breakout on 15m needs 1,920 bars), which then
+            # never fired live, and path-dependent rules drifted away from their backtested signal.
+            days = max(800 * interval_ms(a["interval"]) / 86_400_000, self.s.research_days)
             df = load_history(a["coin"], a["interval"], days, self.s.data_dir)
             sig = float(get_strategy(a["strategy"], **a["params"]).signal(df).iloc[-1])
             t = out.setdefault(a["coin"], {"fraction": 0.0, "stop_loss_pct": a["stop_loss_pct"], "take_profit_pct": 0.0, "parts": []})
@@ -552,6 +581,7 @@ class PortfolioRunner:
             # stay out of that side until the strategies change their mind.
             if applied.get(coin, 0) != 0 and cur == 0:
                 blocked[coin] = applied[coin]
+                self._cool(coin, applied[coin])
                 self.executor.journal.write("stopped_out", coin=coin, side=applied[coin])
                 side_word = "long" if applied[coin] > 0 else "short"
                 self.review_requested = f"the {coin} {side_word} was closed on the exchange by its stop-loss or take-profit"
@@ -563,6 +593,8 @@ class PortfolioRunner:
                     frac, sign = 0.0, 0
                 else:
                     blocked.pop(coin)
+            if sign and self.cooling(coin) == sign:
+                frac, sign = 0.0, 0  # stopped out on this side recently: a new playbook does not lift this
             res = self.executor.set_target(
                 coin,
                 frac * acct.equity if sign else 0.0,
@@ -575,6 +607,7 @@ class PortfolioRunner:
             now = self.executor.broker.account().positions.get(coin) if not self.executor.dry_run else None
             if not self.executor.dry_run and self._trail(coin, t, now) == "closed":
                 blocked[coin] = int(np.sign(now.size))  # exited on the trailing stop: stay out like any stop-out
+                self._cool(coin, blocked[coin], now.entry_px, now.mark_px)
                 side_word = "long" if now.size > 0 else "short"
                 self.review_requested = f"the {coin} {side_word} was closed by its trailing stop or time limit"
                 now = None
@@ -636,6 +669,8 @@ How the pieces work:
 - Every trade has three exits, and you set all of them: the stop (the idea is wrong), the take-profit (the idea has paid), and `max_hold_hours` (the idea has run out of time). A trade taken for a specific catalyst or a short-term bounce should carry a time limit: if the move has not come in the window you expected, the reason for the trade is gone even though neither price level was hit. Leave it at 0 for trend allocations.
 - Correlated legs are one bet. Before finalising weights, `analyze_portfolio` shows how the candidates' out-of-sample returns move together and gives hierarchical-risk-parity weights, which split risk across genuinely different bets instead of across tickers. Use it to decide how much is really riding on one view.
 - Stops ratchet. Each allocation has a `trail_pct` (the stop follows the best price at that distance) and a `breakeven_at_pct` (once the trade has been that far in profit, the stop is at least the entry price). The stop only ever moves in the position's favour, and its level is remembered per position: rewriting the playbook, resizing, or setting a wider stop does not move it back. `get_playbook` shows each position's current trailing level under `trailing_stops`. Leaving them at 0 uses the account default shown as `default_trailing` in the risk limits; the owner wants gains protected, so the default is a wide trail. If the risk limits show an `owner_trailing_cap` other than "none", the owner has chosen to lock gains in sooner and that cap is applied to every position whatever you set: you may go tighter, never wider or off. Plan for it: expect trend trades to be stopped near break-even on ordinary pullbacks, and use the review you get after each stop-out to decide whether to re-enter. The stop on an open position only ever tightens: a new playbook with a wider stop or trail does not move it back, by design. Never close and reopen a position just to get a looser stop; the round trip pays fees and spread twice and usually costs more than the stop was risking. A position you close with close_position is finished, and the next one on that coin starts with a fresh stop and trail, so close only when you would close anyway. Distance matters. In a 150-day backtest of every strategy on eight coins, a trail at the stop distance with a break-even step cut the average return of the 4h trend strategies from about +15% to about +1%, because normal pullbacks shook positions out of trends they would otherwise have ridden; break-even alone cost more than half; a trail twice as wide roughly matched a plain stop. Drawdowns were smaller with trailing, and mean-reversion strategies did slightly better with it. So: keep trend allocations on a wide trail (about twice the stop distance, which is the default) so a big winner cannot come all the way back, and let the strategy's own signal take them out before that; use a tight trail and early break-even for trades with a defined, limited move (a catalyst pop, a squeeze, a mean-reversion bounce), or when protecting a gain matters more to you than catching the rest of the move.
+- After a stop-out (exchange stop, trailing stop or time limit) the same side of that coin is shut for a cooldown, shown with hours left under `cooldown_after_stop` in `get_playbook`. Writing a new playbook does not lift it, and the engine will hold that side flat until it expires; the opposite side is open if the evidence points there. Use the time to look elsewhere instead of re-entering the chop that just stopped you.
+- Call `get_track_record` at every review before writing a playbook. It is the only place you see what your decisions actually earned, after fees, per strategy and timeframe. The research scorecard is a backtest; this is the live result. When a rule or a sleeve keeps losing live over several trades (for example losses several times the size of its wins), cut its weight or drop it even if its backtest looks good, and say so in the rationale. Weigh live results by how many trades they rest on: two trades prove nothing, ten start to.
 - `close_position` closes a coin now and keeps it closed until the strategies flip side or you write a new playbook. Use it to bank a profit or cut a position when your read has changed faster than the strategies will react. Writing a playbook clears every such hold (and any hold left by a stop-out), so that is also how you re-enter.
 - `set_playbook` replaces the whole playbook. Each allocation names a coin, interval and strategy from the scorecard and a weight, which is the fraction of account equity that strategy controls when its signal is fully long or short. Parameters are taken from the research automatically. Several allocations on one coin are netted. `risk_scale` (0 to 1) multiplies every position and is how you express caution without changing the strategy mix. An empty allocation list means the account goes flat.
 - Each cycle starts fresh. Your memory is the journal (`get_recent_decisions`) and the current playbook (`get_playbook`), so put your reasoning and what would change your mind in the rationale and in your final report.
@@ -778,6 +813,94 @@ MANAGER_TOOLS += [
         },
     },
 ]
+MANAGER_TOOLS += [
+    {
+        "name": "get_track_record",
+        "description": "What your past decisions actually earned, from the exchange's own fills: every closed trade (coin, side, hours held, profit after fees, and the strategies the playbook had on that coin when it opened), totals per strategy and timeframe, and the total. Use it to back the rules that have made money live and to drop the ones that keep losing, judged over several trades rather than one.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"days": {"type": "number", "description": "How far back to look, 1 to 30 days"}},
+            "required": ["days"],
+            "additionalProperties": False,
+        },
+    },
+]
+
+
+def track_record(fills: list[dict], playbooks: list[dict], max_trades: int = 30) -> dict:
+    """Round trips rebuilt from fills, each tagged with the playbook legs that were on its coin when it opened.
+
+    A trade starts when a coin's position leaves zero and ends when it returns to zero or flips. Its
+    profit is the exchange's closedPnl minus every fee paid on the way, so it is net of costs.
+    """
+    books = sorted(
+        ((datetime.fromisoformat(p["time"]).timestamp(), p.get("allocations") or []) for p in playbooks if p.get("time")),
+        key=lambda x: x[0],
+    )
+
+    def legs_at(coin: str, t: float) -> list[str]:
+        legs: list[str] = []
+        for when, allocs in books:
+            if when > t:
+                break
+            legs = [f"{a['strategy']}@{a['interval']}" for a in allocs if str(a.get("coin", "")).upper() == coin]
+        return legs or ["manual or no playbook leg"]
+
+    open_: dict[str, dict] = {}
+    trades = []
+    for f in sorted(fills, key=lambda f: int(f["time"])):
+        coin, t = f["coin"], int(f["time"]) / 1000
+        sz = float(f["sz"]) * (1 if f.get("side") == "B" else -1)
+        pnl, fee = float(f.get("closedPnl", 0) or 0), float(f.get("fee", 0) or 0)
+        tr = open_.get(coin)
+        if tr is None:
+            tr = open_[coin] = {"coin": coin, "side": "long" if sz > 0 else "short", "opened": t, "size": 0.0, "pnl": 0.0, "legs": legs_at(coin, t)}
+        before = tr["size"]
+        tr["size"] = before + sz
+        tr["pnl"] += pnl - fee
+        if abs(tr["size"]) < 1e-12 or (before and np.sign(tr["size"]) != np.sign(before)):
+            trades.append({**tr, "closed": t})
+            open_.pop(coin)
+            if abs(tr["size"]) > 1e-12:  # flipped through zero: the remainder is a new trade the other way
+                open_[coin] = {"coin": coin, "side": "long" if tr["size"] > 0 else "short", "opened": t, "size": tr["size"], "pnl": 0.0, "legs": legs_at(coin, t)}
+    by_leg: dict[str, dict] = {}
+    for tr in trades:
+        for leg in tr["legs"]:
+            b = by_leg.setdefault(leg, {"trades": 0, "wins": 0, "pnl_usd": 0.0})
+            b["trades"] += 1
+            b["wins"] += tr["pnl"] > 0
+            b["pnl_usd"] += tr["pnl"] / len(tr["legs"])  # a trade driven by several legs is shared between them
+
+    def stamp(x: float) -> str:
+        return datetime.fromtimestamp(x, timezone.utc).strftime("%m-%d %H:%M")
+
+    wins = [t["pnl"] for t in trades if t["pnl"] > 0]
+    losses = [t["pnl"] for t in trades if t["pnl"] <= 0]
+    return {
+        "closed_trades": len(trades),
+        "net_pnl_usd": round(sum(t["pnl"] for t in trades), 2),
+        "win_rate": round(len(wins) / len(trades), 2) if trades else None,
+        "avg_win_usd": round(float(np.mean(wins)), 2) if wins else None,
+        "avg_loss_usd": round(float(np.mean(losses)), 2) if losses else None,
+        "by_strategy": {
+            k: {**v, "pnl_usd": round(v["pnl_usd"], 2)} for k, v in sorted(by_leg.items(), key=lambda kv: kv[1]["pnl_usd"])
+        },
+        "trades": [
+            {
+                "coin": t["coin"],
+                "side": t["side"],
+                "opened": stamp(t["opened"]),
+                "hours": round((t["closed"] - t["opened"]) / 3600, 1),
+                "pnl_usd": round(t["pnl"], 2),
+                "legs": t["legs"],
+            }
+            for t in trades[-max_trades:]
+        ],
+        "still_open": {c: {"side": t["side"], "opened": stamp(t["opened"]), "fees_and_partial_closes_usd": round(t["pnl"], 2), "legs": t["legs"]} for c, t in open_.items()},
+        "note": "Profit is after fees and excludes funding. A handful of trades is noise; look for a rule that keeps losing over many.",
+    }
+
+
 _KEEP = ("get_account", "get_market_overview", "get_quant_signals", "get_sentiment", "get_recent_decisions", "close_position")
 
 
@@ -801,6 +924,18 @@ class PortfolioAgent(TradingAgent):
 
     def _check_coin(self, coin: str) -> str:
         return coin.upper().strip()  # reading signals for any perp is fine; trading is gated by the risk engine
+
+    def tool_get_track_record(self, a: dict) -> dict:
+        days = min(max(float(a.get("days") or 7), 1.0), 30.0)
+        since = time.time() - days * 86400
+        try:
+            fills = self.executor.broker.fills(int(since * 1000))
+        except Exception as e:
+            return {"error": f"could not read fills: {e}"}
+        if not fills:
+            return {"closed_trades": 0, "note": "no fills in this window (paper accounts keep no exchange history)"}
+        playbooks = self.journal.tail(500, kind="playbook")
+        return {"days": days, **track_record(fills, playbooks)}
 
     def tool_analyze_portfolio(self, a: dict) -> dict:
         keys = [f"{str(x['coin']).upper()}|{x['interval']}|{x['strategy']}" for x in a.get("legs") or []]
@@ -904,6 +1039,11 @@ class PortfolioAgent(TradingAgent):
             "playbook": pb,
             "live_targets": live,
             "blocked_after_stop": self.runner.state["blocked"],
+            "cooldown_after_stop": {
+                c: {"side": "long" if self.runner.cooling(c) > 0 else "short", "hours_left": round((v["until"] - time.time()) / 3600, 1)}
+                for c, v in list(self.runner.state.get("cooldown", {}).items())
+                if self.runner.cooling(c)
+            },
             "trailing_stops": self.runner.state.get("trail", {}),
             "day_sleeve_today": (
                 {k: (round(v, 3) if isinstance(v, float) else v) for k, v in self.runner._day_state().items() if k != "pos"}

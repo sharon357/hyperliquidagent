@@ -47,7 +47,9 @@ def create_app(service: Service | None = None, token: str = "") -> FastAPI:
             async with mcp_server.session_manager.run():
                 yield
 
-    app = FastAPI(title="hyperbot", version="0.1.0", description=__doc__, lifespan=lifespan)
+    # A token means the server is reachable from outside: don't publish an unauthenticated map of its operations.
+    docs = {"docs_url": None, "redoc_url": None, "openapi_url": None} if token else {}
+    app = FastAPI(title="hyperbot", version="0.1.0", description=__doc__, lifespan=lifespan, **docs)
 
     def auth(request: Request) -> None:
         if not token:

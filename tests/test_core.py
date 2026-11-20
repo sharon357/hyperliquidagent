@@ -65,6 +65,35 @@ def test_strategy_signals_in_range_and_causal(name):
     assert np.allclose(part.to_numpy(), full.iloc[:cut].to_numpy(), equal_nan=True)
 
 
+@pytest.mark.parametrize("name", sorted(REGISTRY))
+def test_live_window_matches_research_signal(name):
+    """Live trading recomputes each signal on a trailing window; it must agree with the signal research scored.
+
+    A window shorter than a rule's lookback silently turns it off (a 20-day breakout on 15m candles needs
+    1,920 bars), and path-dependent rules drift when they start too late. Checked on 15m candles, the
+    fastest interval the bot trades, with the window as a share of the history the way the runner loads it.
+    """
+    df = make_df(n=5000, seed=3)
+    df.index = pd.date_range("2025-01-01", periods=len(df), freq="15min", tz="UTC")
+    strat = get_strategy(name)
+    full = strat.signal(df)
+    win = int(len(df) * 0.7)
+    ends = np.linspace(win + 50, len(df), 25).astype(int)
+    agree = [np.sign(strat.signal(df.iloc[e - win:e]).iloc[-1]) == np.sign(full.iloc[e - 1]) for e in ends]
+    assert np.mean(agree) >= 0.96, f"{name}: live-window signal agrees with research only {np.mean(agree):.0%} of the time"
+
+
+def test_runner_loads_research_history(tmp_path, monkeypatch):
+    """The runner must give each strategy at least the history research used, not a fixed 800 bars."""
+    from hyperbot import auto
+
+    seen = []
+    monkeypatch.setattr(auto, "load_history", lambda coin, interval, days, d: seen.append(days) or make_df())
+    s = Settings(data_dir=tmp_path, state_dir=tmp_path, research_days=180.0)
+    auto.PortfolioRunner(s, None).targets({"allocations": [{"coin": "BTC", "interval": "15m", "strategy": "vol_breakout", "params": {}, "weight": 1.0, "stop_loss_pct": 3.0}]})
+    assert seen and seen[0] >= 180.0
+
+
 def test_buy_hold_matches_price_without_costs():
     df = make_df()
     df["funding"] = 0.0
@@ -375,6 +404,84 @@ def test_portfolio_runner_follows_signals_and_blocks_after_stop(stack, monkeypat
     assert not broker.account().positions
 
 
+def test_stop_out_cooldown_survives_a_new_playbook(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    pb = {"risk_scale": 0.5, "allocations": [{"coin": "BTC", "interval": "1h", "strategy": "x", "params": {}, "weight": 0.8, "stop_loss_pct": 2.0}]}
+    runner = auto.PortfolioRunner(s, ex)
+    runner.step(pb)
+    data.prices["BTC"] = 97.0  # stopped out of the long
+    runner.step(pb)
+    assert "BTC" not in broker.account().positions
+    assert runner.cooling("BTC") == 1
+
+    runner.state["blocked"].clear()  # what writing a new playbook does
+    assert runner.step(pb)[0]["status"] == "noop"  # the cooldown still holds the long side shut
+    assert "BTC" not in broker.account().positions
+
+    runner.state["cooldown"]["BTC"]["until"] = 0  # cooldown over
+    assert runner.step(pb)[0]["status"] == "executed"
+    assert broker.account().positions["BTC"].size > 0
+
+
+def test_stop_out_cooldown_can_be_turned_off(stack, monkeypatch):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    s.stop_cooldown_hours = 0.0
+    monkeypatch.setattr(auto, "load_history", lambda *a, **k: make_df(n=50))
+    monkeypatch.setattr(auto, "get_strategy", lambda name, **p: Fixed(1.0))
+    pb = {"risk_scale": 0.5, "allocations": [{"coin": "BTC", "interval": "1h", "strategy": "x", "params": {}, "weight": 0.8, "stop_loss_pct": 2.0}]}
+    runner = auto.PortfolioRunner(s, ex)
+    runner.step(pb)
+    data.prices["BTC"] = 97.0
+    runner.step(pb)
+    runner.state["blocked"].clear()
+    assert runner.step(pb)[0]["status"] == "executed"  # old behaviour: a new playbook re-enters at once
+
+
+def test_track_record_rebuilds_trades_from_fills_and_tags_strategies():
+    from hyperbot import auto
+
+    t0 = 1_763_600_000_000  # ms
+    iso = lambda ms: auto.datetime.fromtimestamp(ms / 1000, auto.timezone.utc).isoformat()
+    playbooks = [
+        {"time": iso(t0 - 60_000), "allocations": [{"coin": "BTC", "interval": "4h", "strategy": "ema_cross"}, {"coin": "ETH", "interval": "15m", "strategy": "carry_trend"}]},
+    ]
+    f = lambda coin, side, sz, pnl, fee, dt: {"coin": coin, "side": side, "sz": str(sz), "closedPnl": str(pnl), "fee": str(fee), "time": t0 + dt}
+    fills = [
+        f("BTC", "A", 0.01, 0, 0.1, 0),           # open short
+        f("BTC", "B", 0.005, 3.0, 0.05, 3_600_000),  # partial cover
+        f("BTC", "B", 0.005, 3.0, 0.05, 7_200_000),  # closed: +6 - 0.2 fees
+        f("ETH", "B", 1.0, 0, 0.2, 0),             # long
+        f("ETH", "A", 2.0, -5.0, 0.4, 600_000),    # flips to short with a loss
+        f("ETH", "B", 1.0, 1.0, 0.2, 1_200_000),   # short closed
+    ]
+    r = auto.track_record(fills, playbooks)
+    assert r["closed_trades"] == 3
+    btc = [t for t in r["trades"] if t["coin"] == "BTC"][0]
+    assert btc["side"] == "short" and btc["pnl_usd"] == pytest.approx(5.8) and btc["hours"] == 2.0
+    assert btc["legs"] == ["ema_cross@4h"]
+    eth = [t for t in r["trades"] if t["coin"] == "ETH"]
+    assert [t["side"] for t in eth] == ["long", "short"]
+    assert eth[0]["pnl_usd"] == pytest.approx(-5.6) and eth[1]["pnl_usd"] == pytest.approx(0.8)
+    assert r["by_strategy"]["carry_trend@15m"]["trades"] == 2 and r["by_strategy"]["carry_trend@15m"]["pnl_usd"] == pytest.approx(-4.8)
+    assert r["net_pnl_usd"] == pytest.approx(1.0)
+    assert not r["still_open"]
+
+
+def test_track_record_tool_on_a_paper_account(stack):
+    from hyperbot import auto
+
+    s, data, broker, ex = stack
+    agent = auto.PortfolioAgent(s, ex, data, client=object(), runner=auto.PortfolioRunner(s, ex))
+    assert "get_track_record" in {t["name"] for t in agent.tool_defs}
+    assert agent.tool_get_track_record({"days": 7})["closed_trades"] == 0
+
+
 def test_autopilot_falls_back_to_rules_without_llm(stack, monkeypatch):
     from hyperbot import auto
 
@@ -530,6 +637,8 @@ def test_api_auth_and_methods(service):
     r = client.post("/v1/set_target", headers=h, json={"coin": "ETH", "target_usd": -1000, "stop_loss_pct": 3})
     assert r.json()["status"] == "executed"
     assert client.post("/v1/unknown", headers=h, json={}).status_code == 404
+    for path in ("/docs", "/redoc", "/openapi.json"):  # a public server publishes no map of itself
+        assert client.get(path).status_code in (401, 404), path
 
 
 # ------------------------------------------------------------------ AI cost and net profit
@@ -1020,6 +1129,7 @@ def test_stop_out_triggers_an_immediate_review_with_cooldown(stack, monkeypatch)
     # A second stop-out straight afterwards waits for the cooldown.
     auto.make_playbook(s, card, [{"coin": "BTC", "interval": "4h", "strategy": "tsmom", "weight": 0.5, "stop_loss_pct": 3}])
     pilot.runner.state["blocked"].clear()
+    pilot.runner.state["cooldown"].clear()  # re-entry cooldown is tested on its own; this test is about reviews
     pilot.tick()
     assert "BTC" in broker.account().positions
     data.prices["BTC"] = 80.0
