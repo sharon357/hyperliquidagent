@@ -635,6 +635,7 @@ def test_manager_can_take_profit_close_and_reenter(stack, monkeypatch):
 
     out = agent.tool_close_position({"coin": "BTC", "reason": "bank it"})  # manual close holds the coin closed
     assert out["status"] == "executed" and "held_closed" in out
+    assert "BTC" not in runner.state.get("trail", {})  # the next BTC trade must not inherit this one's stop
     assert runner.step(auto.load_playbook(s))[0]["status"] == "noop"
     assert not broker.account().positions
 
