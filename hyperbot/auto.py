@@ -595,9 +595,15 @@ class PortfolioRunner:
                     blocked.pop(coin)
             if sign and self.cooling(coin) == sign:
                 frac, sign = 0.0, 0  # stopped out on this side recently: a new playbook does not lift this
+            target_usd = frac * acct.equity if sign else 0.0
+            # Enforce the exchange minimum for every active coin-level target.
+            # The risk manager still applies all position and leverage limits.
+            if sign and 0 < abs(target_usd) < self.s.min_order_usd:
+                target_usd = sign * self.s.min_order_usd
+
             res = self.executor.set_target(
                 coin,
-                frac * acct.equity if sign else 0.0,
+                target_usd,
                 stop_loss_pct=t["stop_loss_pct"] or None,
                 take_profit_pct=t.get("take_profit_pct") or None,
                 source="autopilot",
