@@ -587,7 +587,7 @@ class PortfolioRunner:
                 self.review_requested = f"the {coin} {side_word} was closed on the exchange by its stop-loss or take-profit"
 
             frac = t["fraction"]
-            sign = int(np.sign(frac)) if abs(frac) >= 0.01 else 0
+            sign = int(np.sign(frac)) if frac != 0 else 0
             if blocked.get(coin):
                 if sign == blocked[coin]:
                     frac, sign = 0.0, 0
