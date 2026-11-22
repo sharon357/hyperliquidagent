@@ -518,6 +518,18 @@ class HyperliquidBroker(Broker):
         if reduce_only:
             res = self.exchange.market_close(coin, sz=sz, slippage=self.s.live_slippage)
         else:
+            # Hyperliquid checks the minimum notional after size precision is applied.
+            # Round entry size up when nearest rounding would leave the order below it.
+            mid = self.mids().get(coin)
+            if mid and mid > 0:
+                decimals = self._sz_decimals.get(coin, 4)
+                step = 10 ** -decimals
+                slippage = max(0.0, float(self.s.live_slippage))
+                conservative_px = mid * max(1e-12, 1.0 - slippage)
+                min_notional = self.s.min_order_usd * 1.01
+                min_units = min_notional / conservative_px
+                min_sz = math.ceil(min_units / step - 1e-12) * step
+                sz = max(sz, round(min_sz, decimals))
             res = self.exchange.market_open(coin, delta_units > 0, sz, None, self.s.live_slippage)
         fill = self._parse(coin, res, sign)
         fill.fee = abs(fill.size) * fill.price * self.s.taker_fee  # estimate
